@@ -14,30 +14,30 @@ class ScreenCaptureActivity {
 
     /**
      * Takes a screenshot using AccessibilityService
+     * @param lowQuality Whether to capture a low quality (480p, JPEG) screenshot
      * @return Base64 encoded screenshot string or null if failed
      */
-    suspend fun takeScreenshot(): String? =
+    suspend fun takeScreenshot(lowQuality: Boolean = false): String? =
             withContext(Dispatchers.IO) {
                 try {
-
 
                     val service = MyAccessibilityService.instance
                     if (service == null) {
                         Log.e(TAG, "❌ AccessibilityService not available for screenshot")
-                        return@withContext takeScreenshotFallback()
+                        return@withContext takeScreenshotFallback(lowQuality)
                     }
 
-                    val screenshot = service.takeScreenshot()
+                    val screenshot = service.takeScreenshot(lowQuality)
                     if (screenshot != null) {
 
                         return@withContext screenshot
                     } else {
                         Log.e(TAG, "❌ Screenshot is null, trying fallback")
-                        return@withContext takeScreenshotFallback()
+                        return@withContext takeScreenshotFallback(lowQuality)
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "❌ Exception during screenshot: ${e.message}", e)
-                    return@withContext takeScreenshotFallback()
+                    return@withContext takeScreenshotFallback(lowQuality)
                 }
             }
 
@@ -48,14 +48,13 @@ class ScreenCaptureActivity {
     suspend fun takeRealScreenshot(): String? {
         return try {
 
-
             val service = MyAccessibilityService.instance
             if (service == null) {
                 Log.e(TAG, "❌ AccessibilityService not available for real screenshot")
                 return null
             }
 
-            val screenshot = service.takeScreenshot()
+            val screenshot = service.takeScreenshot(false)
             if (screenshot != null) {
 
                 screenshot
@@ -71,11 +70,11 @@ class ScreenCaptureActivity {
 
     /**
      * Fallback screenshot method using AccessibilityService
+     * @param lowQuality Whether to capture a low quality (480p, JPEG) screenshot
      * @return Base64 encoded screenshot string or null if failed
      */
-    suspend fun takeScreenshotFallback(): String? {
+    suspend fun takeScreenshotFallback(lowQuality: Boolean = false): String? {
         return try {
-
 
             val service = MyAccessibilityService.instance
             if (service == null) {
@@ -83,7 +82,7 @@ class ScreenCaptureActivity {
                 return null
             }
 
-            val screenshot = service.takeScreenshot()
+            val screenshot = service.takeScreenshot(lowQuality)
             if (screenshot != null) {
 
                 screenshot

@@ -1,7 +1,7 @@
 import 'dart:convert';
 import 'dart:async';
 import 'package:flutter/services.dart';
-import '../vertex_ai_client.dart';
+import '../gemini_client.dart';
 import '../tools/tools_manager.dart';
 
 class AutomationService {
@@ -22,7 +22,7 @@ class AutomationService {
   // Service state
   bool _isAutomating = false;
   bool _isInitialized = false;
-  VertexAIClient? _aiClient;
+  GeminiClient? _aiClient;
   bool _llmRequestOngoing = false;
   DateTime? _lastLlmRequestedAt;
   Map<String, dynamic>? _lastContext; // latest captured screen context
@@ -30,6 +30,7 @@ class AutomationService {
   // Task state
   String? _currentTask;
   List<Map<String, dynamic>> _taskHistory = [];
+  List<String> _installedApps = [];
   int _currentStep = 0;
   
   // Field tracking state - prevent repeated taps on same field
@@ -38,6 +39,15 @@ class AutomationService {
   
   // Replay state - store tap coordinates for replay functionality
   Map<String, dynamic>? _lastTapCoordinates;
+  
+  // Retry state
+  int _stepRetryCount = 0;
+  String? _lastError;
+  String? _lastFailedAction;
+  
+  // Persistent Vision Mode - once activated, stays active for entire task
+  bool _visionModePersistent = false;
+  String? _visionModeReason;
 
   // Public getters
   bool get isAutomating => _isAutomating;
@@ -59,7 +69,7 @@ class AutomationService {
       print('📡 Method channel handler set up for automation service singleton');
 
       // Initialize AI client
-      _aiClient = VertexAIClient();
+      _aiClient = GeminiClient();
       await _aiClient!.initialize();
 
       // Skip AI testing - start automation instantly
@@ -128,12 +138,37 @@ class AutomationService {
     _currentStep = 0;
     _processedFields.clear(); // Reset field tracking for new task
     _lastTappedField = null;
+    _visionModePersistent = false; // Reset vision mode for new task
+    _visionModeReason = null;
     _isAutomating = true;
+    _installedApps.clear(); // Clear previous apps list
     
     // Notify UI that automation state changed to true
     onAutomationStateChanged?.call(true);
 
     try {
+      // 1. Fetch Inventory of Installed Apps
+      print('📦 Fetching installed apps inventory...');
+      try {
+        final appsResult = await ToolsManager.executeTool('get_launchable_apps', {});
+        if (appsResult['success'] == true && appsResult['data'] is List) {
+          final apps = List<dynamic>.from(appsResult['data']);
+          // Extract app names, distinct and sorted
+          _installedApps = apps
+              .map((a) => (a is Map ? a['name']?.toString() ?? '' : '').trim())
+              .where((name) => name.isNotEmpty)
+              .toSet()
+              .toList()
+            ..sort();
+          
+          print('✅ Loaded ${_installedApps.length} installed apps for context');
+        } else {
+          print('⚠️ Failed to load apps: ${appsResult['error']}');
+        }
+      } catch (e) {
+        print('❌ Error fetching apps: $e');
+      }
+
       // Start the automation loop
       await _executeAutomationLoop();
     } catch (e) {
@@ -163,7 +198,12 @@ class AutomationService {
     bool forceContextRefresh = false;
 
     while (_isAutomating) {
-      _currentStep++;
+      if (_stepRetryCount == 0) {
+        _currentStep++;
+        _lastError = null; // Clear error on fresh step
+      } else {
+        print('🔄 Retry attempt $_stepRetryCount for step $_currentStep');
+      }
 
       // Get current screen context
       final screenContext = await _captureScreenContext();
@@ -182,11 +222,29 @@ class AutomationService {
       // Build AI prompt with visual context and strict validation rules
       final prompt = _buildStepPrompt(screenContext);
 
+      // Extract image for Vision Fallback if available
+      String? visionImage;
+      if (screenContext['vision_fallback_active'] == true &&
+          screenContext['low_quality_screenshot'] is String) {
+        visionImage = screenContext['low_quality_screenshot'];
+      }
+
       // Get AI decision
-      final aiResponse = await _getAIDecision(prompt);
+      final aiResponse = await _getAIDecision(prompt, image: visionImage);
       if (aiResponse == null) {
-        _notifyError('Failed to get AI response');
-        break;
+        _stepRetryCount++;
+        _lastError = 'Failed to get AI response';
+        print('❌ AI response failed (attempt $_stepRetryCount/3)');
+        
+        if (_stepRetryCount >= 3) {
+          _notifyError('Failed to get AI response after 3 attempts');
+          _stepRetryCount = 0;
+          break;
+        }
+        
+        // Wait before retry
+        await Future.delayed(const Duration(seconds: 2));
+        continue;
       }
 
       // Store current context for next iteration comparison
@@ -282,24 +340,86 @@ class AutomationService {
       final screenshotAvailable = screenshotResult['success'] == true;
       print('🔍 screenshotResult: success=${screenshotResult['success']}, data type=${screenshotResult['data']?.runtimeType}');
 
-      // Fallback to OCR when accessibility tree is empty or likely web content
+      // Fallback to OCR/Vision when accessibility tree is empty or likely web content
       String ocrText = '';
       List<dynamic> ocrBlocks = const [];
+      String? lowQualityScreenshotBase64;
+      // Use persistent vision mode if already triggered, or evaluate conditions
+      // Default to false - only enable if we successfully prepare visual context
+      bool visionFallbackActive = false;
+
       final isA11yEmpty = accessibilityTree.isEmpty;
       final classHints = _collectClassHints(accessibilityTree);
-      final looksLikeWeb = classHints.any((c) => c.contains('WebView') || c.contains('webview') || c.contains('ComposeView'));
+      final looksLikeWeb = classHints.any((c) =>
+          c.contains('WebView') ||
+          c.contains('webview') ||
+          c.contains('ComposeView'));
+      
+      // Check for consecutive screenshot calls in history
+      bool stuckOnScreenshot = false;
+      if (_taskHistory.length >= 2) {
+        final lastAction = _taskHistory.last['action'];
+        final secondLastAction = _taskHistory[_taskHistory.length - 2]['action'];
+        if (lastAction == 'take_screenshot' && secondLastAction == 'take_screenshot') {
+          stuckOnScreenshot = true;
+          print('⚠️ Detected consecutive screenshot calls - triggering Vision Fallback');
+        }
+      }
+
       Map<String, double>? contextDimensions = {};
-      if ((isA11yEmpty || looksLikeWeb) && screenshotAvailable) {
+
+      // Run vision capture if:
+      // 1. Vision mode is already persistently enabled, OR
+      // 2. Any of the initial trigger conditions are met
+      final shouldActivateVision = _visionModePersistent || isA11yEmpty || looksLikeWeb || stuckOnScreenshot;
+      
+      if (shouldActivateVision && screenshotAvailable) {
         final screenshotB64 = (screenshotResult['data'] as String?);
         if (screenshotB64 != null && screenshotB64.isNotEmpty) {
-          print('🟡 Accessibility tree is ${isA11yEmpty ? 'empty' : 'possibly web content'} → running OCR...');
+          // Log reason for vision mode
+          if (_visionModePersistent) {
+            print('🔒 Vision Mode ACTIVE (persistent from: $_visionModeReason)');
+          } else {
+            print('🟡 Triggering Vision Fallback (Reason: ${stuckOnScreenshot ? 'stuck on screenshot' : (isA11yEmpty ? 'empty tree' : 'web content')})');
+          }
+
+          // 1. Vision Capture (Reliable: Resize existing screenshot)
+          try {
+            print(
+                '📸 Processing vision fallback image (Compressing for speed, keeping original dims)...');
+            final lqResult = await ToolsManager.executeTool('resize_image', {
+              'base64Image': screenshotB64,
+              'targetWidth': 3000, // Keep original dimensions (don't resize unless huge)
+              'quality': 40 // Lower quality to reduce size while keeping resolution
+            });
+            if (lqResult['success'] == true && lqResult['data'] is String) {
+              lowQualityScreenshotBase64 = lqResult['data'];
+              visionFallbackActive = true;
+              
+              // PERSIST vision mode for the rest of the task
+              if (!_visionModePersistent) {
+                _visionModePersistent = true;
+                _visionModeReason = stuckOnScreenshot ? 'stuck_on_screenshot' : (isA11yEmpty ? 'empty_tree' : 'web_content');
+                print('🔒 Vision mode LOCKED ON - will stay active for entire task');
+              }
+              print('✅ Vision capture successful (Resized)');
+            } else {
+              print('❌ Vision resize failed: ${lqResult['error']}');
+            }
+          } catch (e) {
+            print('❌ Vision capture failed: $e');
+          }
+
+          // 2. OCR (Existing Logic - keep as supplementary)
           final ocrResult = await ToolsManager.executeTool('perform_ocr', {
             'screenshot': screenshotB64,
           });
           if (ocrResult['success'] == true && ocrResult['data'] is Map) {
             final data = Map<String, dynamic>.from(ocrResult['data']);
             ocrText = (data['text']?.toString() ?? '').trim();
-            ocrBlocks = (data['blocks'] is List) ? List.from(data['blocks']) : <dynamic>[];
+            ocrBlocks = (data['blocks'] is List)
+                ? List.from(data['blocks'])
+                : <dynamic>[];
             // Attach OCR image dimensions for coordinate normalization
             if (data['imageWidth'] != null && data['imageHeight'] != null) {
               contextDimensions = {
@@ -308,12 +428,21 @@ class AutomationService {
               };
             }
             if (ocrText.isNotEmpty) {
-              print('✅ OCR extracted ${ocrText.length} chars (${ocrBlocks.length} blocks)');
+              print(
+                  '✅ OCR extracted ${ocrText.length} chars (${ocrBlocks.length} blocks)');
             } else {
               print('⚠️ OCR returned no text');
             }
           } else {
             print('❌ OCR failed: ${ocrResult['error']}');
+          }
+
+          // Store vision dimensions if active
+          if (visionFallbackActive) {
+            contextDimensions ??= {};
+            // We are now keeping original dimensions, so vision width matches device/OCR width
+            // Set it to OCR width if available, or 0 (which disables scaling)
+            contextDimensions!['visionImageWidth'] = contextDimensions['ocrImageWidth'] ?? 0.0;
           }
         }
       }
@@ -330,6 +459,10 @@ class AutomationService {
         'ocr_blocks': ocrBlocks,
         'ocr_image_width': (contextDimensions['ocrImageWidth'] ?? 0.0),
         'ocr_image_height': (contextDimensions['ocrImageHeight'] ?? 0.0),
+        'vision_image_width': (contextDimensions['visionImageWidth'] ?? 0.0),
+        'low_quality_screenshot': lowQualityScreenshotBase64,
+        'vision_fallback_active': visionFallbackActive,
+        'vision_fallback_reason': stuckOnScreenshot ? 'stuck_on_screenshot' : (isA11yEmpty ? 'empty_tree' : 'web_content'),
         'timestamp': DateTime.now().millisecondsSinceEpoch,
       };
 
@@ -428,7 +561,79 @@ bool _isContextIdentical(Map<String, dynamic> prev, Map<String, dynamic> current
   }
 }
 
+String _buildVisionStepPrompt(Map<String, dynamic> context) {
+  // Build history summary
+  String historyText = '';
+  if (_taskHistory.isNotEmpty) {
+    historyText = '\nCOMPLETED STEPS:\n';
+    for (int i = 0; i < _taskHistory.length; i++) {
+        final step = _taskHistory[i];
+        historyText += '${i + 1}. ${step['action']} - ${step['description']}\n';
+    }
+  }
+
+  // Vision Mode Prompt - Streamlined & Visual-First
+  return '''
+👁️ VISUAL AUTOMATION AGENT (VISION MODE)
+You are an intelligent visual agent operating an Android device. 
+Standard accessibility data has FAILED. You must rely on the SCREENSHOT to understand the UI.
+
+🎯 PRIMARY GOAL: $_currentTask
+Step: $_currentStep
+History: $historyText
+
+🖼️ VISUAL INTELLIGENCE
+- The provided image is the REAL-TIME screen state.
+- x,y coordinates provided by you must be NORMALIZED to a 0-1000 scale.
+- (0,0) is top-left, (1000,1000) is bottom-right.
+- Ignore "0 accessibility nodes" warnings - they are expected in this mode.
+
+🧠 REASONING PROTOCOL (Vision First)
+1. **Analyze the Image**: Identify buttons, icons, and text visually.
+2. **Locate Target**: Find the UI element that moves you closer to the PRIMARY GOAL.
+3. **Action**: 
+   - Use `tap_vision` for buttons/icons. 
+   - Use `perform_grouped_taps` to TYPE on the visual keyboard.
+   - Use `perform_scroll` if the target is off-screen.
+
+🚀 AVAILABLE ACTIONS (Vision Mode)
+• tap_vision {"x": 500, "y": 500, "description": "Tap Blue Submit Button"} 
+  - PREFERRED for clicking. 
+  - x,y must be 0-1000 normalized coordinates.
+• perform_grouped_taps {"taps": [{"x":500,"y":800}, ...]} 
+  - PREFERRED for typing. 
+  - taps must use 0-1000 normalized coordinates.
+• perform_swipe / perform_scroll 
+  - Use for navigation.
+• perform_home / perform_back
+
+❌ DO NOT use `tap_element_by_text` unless you are 100% sure the system detected it (which is unlikely in Vision Mode).
+❌ DO NOT give up. You have full visual control.
+
+✅ RESPONSE FORMAT
+<thought>
+I see the "Login" button at the bottom (approx x=500, y=1000).
+My goal is to log in.
+I will tap it.
+</thought>
+```json
+{
+  "action": "tap_vision",
+  "parameters": {"x": 500, "y": 1000, "description": "Login button"},
+  "description": "Tapping login button visually",
+  "is_complete": false,
+  "reasoning": "Visual identification of login button"
+}
+```
+''';
+}
+
 String _buildStepPrompt(Map<String, dynamic> context) {
+  // Dispatch to specialized Vision Mode prompt if active
+  if (context['vision_fallback_active'] == true) {
+    return _buildVisionStepPrompt(context);
+  }
+
   final currentApp = context['current_app'] is Map
       ? Map<String, dynamic>.from(context['current_app'])
       : <String, dynamic>{};
@@ -444,6 +649,7 @@ String _buildStepPrompt(Map<String, dynamic> context) {
   final hasScreenshot = context['screenshot_available'] == true;
   final ocrText = context['ocr_text'] is String ? (context['ocr_text'] as String) : '';
   final hasOcr = ocrText.isNotEmpty;
+  final visionActive = context['vision_fallback_active'] == true;
   // Extract simple hints for form inputs from a11y and OCR
   final inputHints = <String>[];
   final a11y = context['accessibility_tree'];
@@ -607,10 +813,10 @@ You must only respond with raw JSON in the following structure:
 ''';  
   */
 
-  // ENHANCED HUMAN-LIKE AUTOMATOR AI AGENT PROMPT
-  return '''
+  // ENHANCED HUMAN-LIKE AUTOMATOR AI AGENT PROMPT - CHAIN OF THOUGHT ENABLED
+  String prompt = '''
 🤖 HUMAN-LIKE MOBILE AUTOMATOR AGENT
-You are an intelligent mobile automation agent that mimics human interaction patterns with Android devices. Think like a human user who naturally navigates apps, types text, scrolls through content, and completes tasks efficiently. Your goal is to execute the given task with human-like precision and intuition but use with declared tools..
+You are an intelligent mobile automation agent that mimics human interaction patterns. Your goal is to complete the user's task by navigating the screen, interacting with elements, and managing state effectively.
 
 🎯 MISSION BRIEFING
 - Primary Task: $_currentTask
@@ -618,7 +824,6 @@ You are an intelligent mobile automation agent that mimics human interaction pat
 - Journey So Far: $historyText
 
 📱 CURRENT SCREEN INTELLIGENCE
-- Visual Context: $hasScreenshot
 - Interactive Elements: ${screenElements.length} available
 - Accessibility Nodes: ${accessibilityTree.length} detected
 - System Alerts: ${systemDialogs.length} active
@@ -636,231 +841,129 @@ ${systemDialogs.isNotEmpty ? _formatSystemDialogs(systemDialogs) : '[Clean scree
 
 👁️ VISUAL TEXT RECOGNITION (OCR)
 ${hasOcr ? ocrText : '[No readable text detected on screen]'}
+${visionActive ? '\n⚠️ VISION FALLBACK ACTIVE: ${context['vision_fallback_reason'] == 'stuck_on_screenshot' ? 'You are stuck calling take_screenshot repeatedly. Use the visual screenshot to find elements and TAP COORDINATES directly.' : 'Accessibility tree is limited. I have provided a visual screenshot. use perform_tap with {x,y} coordinates.'}' : ''}
+
+📦 INSTALLED APPS INVENTORY (Launchable)
+${_installedApps.isEmpty ? '[No apps detected]' : _installedApps.join(', ')}
 
 ═══════════════════════════════════════════════════════════════
 
-🧠 HUMAN-LIKE AUTOMATION INTELLIGENCE
+🧠 INTELLIGENT REASONING PROTOCOL (Requires <thought> block)
 
-FIRST AND FOREMOST RULE: PRIORITIZE open_app_by_name FOR ALL APP SWITCHING/OPENING
-• ALWAYS use open_app_by_name as the PRIMARY method for opening or switching to any application
-• Use exact app labels (e.g., "YouTube", "Chrome", "WhatsApp", "Whatsapp Business", Gmail", "Maps")
-• Only fallback to home screen navigation if open_app_by_name fails
-• NEVER interact with the AI agent screen - always switch to the target app immediately
-• Based on user context, decide the related app and open it using open_app_by_name with perfect label
+1. **FIRST STEP - APP SELECTION (CRITICAL)**:
+   - If this is the FIRST step (History is empty) or the user asks to use a specific service (Food, Cab, Chat):
+     - CHECK the 'INSTALLED APPS INVENTORY' above.
+     - MATCH the user's intent to an Installed App (e.g., "Food" -> Zomato/Swiggy, "Cab" -> Uber/Ola).
+     - ACTION: IMMEDIATELY use `open_app_by_name` with the best match.
+     - DO NOT assume you are already in the correct app. Open it explicitly.
 
-🎯 CORE BEHAVIORAL PATTERNS:
-• FRESH EYES APPROACH: Analyze each screen as if seeing it for the first time
-• NATURAL FLOW: Follow intuitive user journeys (search → browse → select → confirm)
-• CONTEXT AWARENESS: Understand app-specific UI patterns and conventions
-• ADAPTIVE STRATEGY: Switch between touch methods based on what's most reliable
-• GOAL-ORIENTED: Every action must advance toward task completion
+2. **HISTORY ANALYSIS**:
+   - READ the "Journey So Far" or "COMPLETED STEPS" carefully.
+   - DID THE LAST ACTION FAIL? If you tried to tap something and the screen didn't change (Verify timestamps if possible), DO NOT TRY THE EXACT SAME THING.
+   - If you are in a loop (e.g., Tapping "Next" repeatedly), STOP and try a different strategy (e.g., scroll down, dismiss popup, or use a different identifier).
 
-🎪 SMART APP ROUTING:
-• Food & Dining → Zomato, Swiggy, UberEats, DoorDash
-• Transportation → Uber, Ola, Google Maps, Lyft
-• Shopping → Amazon, Flipkart, eBay, Myntra
-• Communication → WhatsApp, Gmail, Telegram, SMS
-• Entertainment → YouTube, Netflix, Spotify, Instagram
-• Productivity → Google Drive, Docs, Calendar, Notes
+3. **OBSERVATION**:
+   - Look at the "CURRENT SCREEN INTELLIGENCE".
+   - Is the target element actually visible in `INTERACTIVE ELEMENTS MAP` or `ACCESSIBILITY NAVIGATION TREE`?
+   - If NOT visible, do NOT hallucinate it. You MUST scroll to find it.
+   - If VISION FALLBACK ACTIVE is indicated below, use the provided visual screenshot to find elements. Use `perform_tap` with estimated {x, y} coordinates.
 
-🎨 INTELLIGENT INTERACTION STRATEGIES:
+3. **STRATEGY**:
+   - Planning to fill a form? Plan the sequence: Tap Name -> Type Name -> Tap Email -> Type Email.
+   - Do not rely on "Fresh Eyes". Relate the current screen to your goal and past actions.
 
-📝 TEXT INPUT MASTERY:
-• ⚠️ MANDATORY: ALWAYS tap/focus input fields before typing - NEVER type without tapping first
-• ⚠️ CRITICAL: Even if a field appears focused, ALWAYS tap it before typing to ensure proper focus
-• Use advanced_type_text with clearFirst for pre-filled fields
-• Handle autocomplete suggestions intelligently
-• Validate input success and retry with alternative methods if needed
-• Support multi-field forms with logical sequential filling
+═══════════════════════════════════════════════════════════════
 
-🔄 SMART SCROLLING BEHAVIOR:
-• BEFORE SCROLL: Thoroughly scan current accessibility tree + OCR for target content
-• HUMAN-LIKE PATTERN: Scroll in natural chunks, not excessive amounts
-• POST-SCROLL PATIENCE: Wait for content to load and UI to stabilize
-• CONTENT VALIDATION: Verify new content appeared before next action
-• AVOID REDUNDANCY: Never scroll if target is already visible
+🚀 AVAILABLE ACTIONS:
 
-🎯 PRECISION TARGETING HIERARCHY:
-1. ACCESSIBILITY-FIRST: Use element indices when available (most reliable)
-2. OCR-SMART: Leverage text recognition with precise coordinate calculation
-3. COORDINATE-FALLBACK: Manual coordinates only when other methods fail
-4. BOUNDS-CALCULATION: For OCR bounds {"left":x,"top":y,"right":x2,"bottom":y2}, tap center: ((left+right)/2, (top+bottom)/2)
-
-🚀 AVAILABLE HUMAN-LIKE ACTIONS:
-
-📱 CORE INTERACTIONS:
+📱 INTERACTIONS:
 • take_screenshot - Capture current screen state
 • tap_element_by_text {"text": "exact_text"} - Tap by visible text
-• tap_element_by_index {"index": number} - Tap by accessibility index
+• tap_element_by_index {"index": number} - Tap by accessibility index (MOST RELIABLE)
 • tap_element_by_bounds {"left":x,"top":y,"right":x2,"bottom":y2} - Tap by coordinates
-• tap_ocr_text {"text": "visible_text"} - Tap OCR-detected text
+• tap_ocr_text {"text": "visible_text"} - Tap OCR-detected text (less accurate)
 • tap_ocr_bounds {"left":x,"top":y,"right":x2,"bottom":y2} - Tap OCR bounds
-• perform_tap {"x":x,"y":y} - Direct coordinate tap with overlay detection and node-based fallback
-• perform_long_press {"x":x,"y":y} - Long press gesture
+• perform_tap {"x":x,"y":y} - Direct coordinate tap
 
-🎮 NAVIGATION & GESTURES:
-• perform_swipe {"startX":x1,"startY":y1,"endX":x2,"endY":y2} - Swipe gesture
-• perform_scroll {"direction": "up/down/left/right"} - Natural scrolling
-• perform_dynamic_scroll {"direction": "up/down","targetText":"search_text","maxScrollAttempts":3} - Smart target scrolling
-• perform_back - Navigate back
-• perform_home - Go to home screen
-• perform_enter - Press enter key
+🌐 AI VISION TAP (RECOMMENDED when accessibility fails):
+• tap_vision {"description": "What to tap", "x": 500, "y": 500}
+  - Use this when VISION FALLBACK is active or accessibility tree doesn't have your target.
+  - YOU determine the x,y coordinates by looking at the screenshot.
+  - x,y are NORMALIZED coordinates (0-1000) relative to image width/height.
+  - (0,0) = Top-Left, (1000,1000) = Bottom-Right.
 
-⌨️ TEXT INPUT ARSENAL:
-• advanced_type_text {"text":"content","clearFirst":true,"delayMs":100} - Advanced typing with options
-• non_tap_text_input {"text":"content", "fieldId":"optional_field_id"} - Direct text injection without tapping (uses AccessibilityService with overlay detection)
-• get_focused_input_info {} - Get information about currently focused input field
+🎮 NAVIGATION:
+• perform_swipe {"startX":x1,"startY":y1,"endX":x2,"endY":y2}
+• perform_scroll {"direction": "up/down/left/right"}
+• perform_back
+• perform_home
+• perform_enter
 
-🎯 CRITICAL INPUT FIELD PROTOCOLS:
-• OVERLAY DETECTION: System automatically detects suggestion lists, dropdowns, and overlays that interfere with input
-• NODE-BASED INTERACTIONS: When overlays are present, uses AccessibilityNodeInfo actions instead of coordinate taps
-• ⚠️ ALWAYS TAP FIRST: Before typing, MUST tap the exact input field using tap_element_by_text, tap_element_by_bounds, or tap_ocr_text
-• ⚠️ NO EXCEPTIONS: Even if a field is already focused, ALWAYS tap it before typing to prevent input failures
-• FIELD IDENTIFICATION: Scan accessibility tree for EditText, TextField, or input elements with proper bounds
-• CONTEXT AWARENESS: Read field labels, placeholders, and hints to understand what input is expected
-• SUGGESTION HANDLING: System intelligently handles autocomplete dropdowns without coordinate interference
-• MULTI-FIELD STRATEGY: For multiple inputs on screen, process ONE field at a time with proper focus
-• VALIDATION FEEDBACK: Check for error states, field highlighting, or validation messages after input
-• COORDINATE SAFETY: Never trust raw coordinates when overlays are detected - always resolve to actual UI nodes
+⌨️ TEXT INPUT:
+• advanced_type_text {"text":"content","clearFirst":true,"delayMs":100}
+• type_text {"text":"content"}
+(MANDATORY: You MUST tap/focus the field before typing, unless you just did so in the previous step and confirmed focus).
+
+⌨️ VISION MODE TYPING (When keyboard is visible):
+• perform_grouped_taps {"taps": [{"x":100,"y":200}, {"x":120,"y":200}]}
+  - Use this in VISION MODE when blind typing fails or to type on the virtual keyboard.
+  - Look at the screenshot to find key positions.
+  - Send a list of coordinates to type the whole word/sentence in ONE request.
+  - If keyboard is NOT visible in vision mode, tap the input field first.
 
 🚀 APP MANAGEMENT:
-• open_app_by_name {"appName": "App Name"} - Launch specific application
+• open_app_by_name {"appName": "App Name"}
 
 ═══════════════════════════════════════════════════════════════
 
-🎯 INTELLIGENT DECISION FRAMEWORK:
+✅ RESPONSE FORMAT
 
-🔍 PRE-ACTION ANALYSIS:
-1. SCREEN COMPREHENSION: What app am I in? What's the current context?
-2. TASK ALIGNMENT: Does this screen help achieve the goal?
-3. ELEMENT IDENTIFICATION: What interactive elements are available?
-4. OPTIMAL PATH: What's the most human-like way to proceed?
+You must output your response in TWO parts:
+1. A `<thought>` block where you analyze the history, screen state, and plan your move.
+2. A JSON block with the final specific action.
 
-🔍 ENHANCED SCREEN CONTEXT ANALYSIS:
-• INPUT FIELD DETECTION: Scan accessibility tree for EditText, TextField, and input elements
-• FIELD LABELING: Identify field labels, placeholders, hints, and associated text
-• FIELD POSITIONING: Note exact bounds and coordinates of each input field
-• FIELD STATES: Check if fields are empty, filled, focused, or showing errors
-• SUGGESTION ELEMENTS: Look for autocomplete dropdowns, suggestion lists, or picker dialogs
-• KEYBOARD STATE: Determine if virtual keyboard is visible and affecting layout
-
-🧠 HUMAN DYNAMIC BEHAVIORS:
-• NATURAL HESITATION: Occasionally pause to "read" content before acting (simulate human processing time)
-• EXPLORATION PATTERNS: Sometimes check nearby elements before selecting target (human curiosity)
-• ADAPTIVE SCROLLING: Vary scroll distances - small precise scrolls vs larger sweeping motions
-• CONTEXTUAL AWARENESS: Reference previous actions and learn from app patterns
-• ERROR RECOVERY: When actions fail, try alternative approaches like a human would
-• READING SIMULATION: Spend time on text-heavy screens before proceeding
-• PROGRESSIVE DISCLOSURE: Gradually explore UI elements rather than jumping directly to targets
-
-🎪 SCROLL INTELLIGENCE MATRIX:
-┌─ BEFORE SCROLL: Scan accessibility tree + OCR for target content
-├─ IF TARGET FOUND: Use tap_element_by_text/index/ocr instead of scrolling
-├─ IF TARGET MISSING: Execute scroll with human-like distance
-├─ AFTER SCROLL: Wait for UI stabilization and content loading
-└─ VALIDATE PROGRESS: Confirm new content appeared before next action
-
-📋 FORM COMPLETION MASTERY:
-1. FIELD DISCOVERY: Identify all input fields via accessibility + OCR
-2. LOGICAL ORDERING: Fill fields in natural human sequence (top-to-bottom, left-to-right)
-3. FIELD FOCUSING: ⚠️ MANDATORY - Tap each field before typing (even if already focused)
-4. ⚠️ NO REPETITION: Never tap the same field twice - process each field only once
-5. SEQUENTIAL PROCESSING: Complete one field fully before moving to the next
-6. SMART INPUT: Use advanced_type_text with appropriate options
-7. VALIDATION: Confirm input success before moving to next field
-8. SUGGESTION HANDLING: Intelligently interact with autocomplete/dropdowns
-
-⌨️ MANDATORY INPUT FIELD WORKFLOW:
-1. IDENTIFY TARGET: Locate the specific input field in accessibility tree or OCR
-2. TAP TO FOCUS: Use tap_element_by_text, tap_element_by_bounds, or tap_ocr_text to focus field
-3. VERIFY FOCUS: Confirm cursor appears in the correct field
-4. TYPE CONTENT: Use type_text or advanced_type_text with appropriate content
-5. HANDLE SUGGESTIONS: If autocomplete appears, decide whether to select or continue typing
-6. VALIDATE INPUT: Check for errors, field highlighting, or validation feedback
-7. PROCEED TO NEXT: Only move to next field after current field is complete
-
-NEVER type without first tapping the target input field!
-
-═══════════════════════════════════════════════════════════════
-
-🚫 CRITICAL EXECUTION SAFEGUARDS:
-
-🔄 ACTION EXECUTION INTEGRITY:
-• MANDATORY EXECUTION: Every action specified in the JSON response MUST be executed via tool call
-• NO PHANTOM COMPLETION: Never mark steps as complete without actually performing the required action
-• TOOL CALL VALIDATION: Each JSON response must be immediately followed by the corresponding function execution
-• ACTION-RESULT COUPLING: Wait for tool execution result before proceeding to next step
-• PROGRESS VERIFICATION: Confirm each action achieved its intended effect before moving forward
-
-🎯 NEXT STEP PLANNING EXCELLENCE:
-• SCREEN-FIRST ANALYSIS: Always analyze current screen state before determining next action
-• CONTEXTUAL PROGRESSION: Each step must logically build upon previous actions and current screen context
-• GOAL CONVERGENCE: Every action must demonstrably advance toward task completion
-• ADAPTIVE PATHFINDING: Adjust strategy based on actual screen content and available elements
-• OBSTACLE NAVIGATION: Handle unexpected screens, popups, or UI changes intelligently
-• COMPLETION CRITERIA: Only set "is_complete": true when final objective is visibly achieved
-
-🧠 SMART DECISION MATRIX:
-1. SCREEN ASSESSMENT: What's currently visible and available for interaction?
-2. PROGRESS EVALUATION: How does current state compare to desired outcome?
-3. NEXT LOGICAL STEP: What specific action will move closest to completion?
-4. EXECUTION METHOD: Which tool/approach is most reliable for this action?
-5. SUCCESS VALIDATION: How will I know this action succeeded?
-6. CONTINGENCY PLANNING: What alternatives exist if primary approach fails?
-
-🔍 ENHANCED STEP PLANNING LOGIC:
-• MICRO-PROGRESSION: Break complex actions into granular, executable steps
-• STATE DEPENDENCIES: Recognize when certain screen states are prerequisites for next actions
-• UI TIMING: Account for loading states, animations, and response delays
-• ELEMENT AVAILABILITY: Confirm required elements exist before attempting interaction
-• FALLBACK STRATEGIES: Prepare alternative approaches for common interaction failures
-• COMPLETION SIGNALS: Identify clear indicators that mark task completion
-
-═══════════════════════════════════════════════════════════════
-
-✅ RESPONSE PROTOCOL
-Respond ONLY with this exact JSON structure:
-
+Example:
+<thought>
+I see the "Login" button at index 5.
+Looking at history, I just typed the password.
+The virtual keyboard is visible.
+I will now tap the login button to proceed.
+</thought>
+```json
 {
-  "action": "action_name",
-  "parameters": {"key": "value"},
-  "description": "Human-readable explanation of this step",
+  "action": "tap_element_by_index",
+  "parameters": {"index": 5},
+  "description": "Tapping login button",
   "is_complete": false,
-  "reasoning": "Why this action makes sense in current context and how it advances toward completion"
+  "reasoning": "Submitting credentials after typing password."
 }
+```
 
 RULES:
-• Set "is_complete": true only when the entire task is finished AND visually confirmed
-• Never include explanatory text outside the JSON
-• One action per response for precision and verification
-• Always include comprehensive reasoning that explains progression logic
-• Each action must be immediately executable with current screen elements
-• Wait for tool execution completion before considering step finished
-
-═══════════════════════════════════════════════════════════════
-
-🎯 EXECUTION PRIORITY STACK:
-🥇 Accessibility elements (highest reliability)
-🥈 OCR text/bounds (visual backup)
-🥉 Manual coordinates (last resort)
-
-🎪 DYNAMIC EXECUTION BEHAVIORS:
-• CONTEXT SWITCHING: Acknowledge when moving between different app sections
-• LEARNING PATTERNS: Reference similar actions performed earlier in the session
-• UNCERTAINTY HANDLING: Express when multiple options exist and explain choice reasoning
-• PROGRESS TRACKING: Mention how current action advances toward the overall goal
-• ENVIRONMENTAL AWARENESS: Notice and comment on UI changes, loading states, or transitions
-• ADAPTIVE STRATEGY: Adjust approach based on app responsiveness and UI patterns
-• HUMAN CURIOSITY: Occasionally explore or mention interesting UI elements discovered
-
-Now analyze the current screen with fresh human-like intelligence and determine the next optimal action to advance toward the goal!
-
+- "is_complete": true ONlY when the overarching task is DONE.
+- ONE action per JSON.
+- DO NOT hallucinate elements. If it's not in the lists, scroll or look harder.
 ''';
-}
 
+    // If we have a stored error from a retry, inject it prominently
+    if (_lastError != null) {
+      prompt += '''
+\n❌ PREVIOUS ACTION FAILED (Attempt $_stepRetryCount/3)
+Error: $_lastError
+Action: $_lastFailedAction
+⚠️ RECOVERY INSTRUCTIONS: The previous attempt failed. DO NOT REPEAT the exact same action.
+1. If "Element not found": Scroll to find it, or use Vision (tap_ocr_text) or Coordinate Tap.
+2. If "Text input failed": Try clicking the field first, or use a looser match.
+3. If "Stuck": Change strategy completely.
+''';
+    }
+
+    return prompt;
+  }
 
   /// Get AI decision for next step
-  Future<Map<String, dynamic>?> _getAIDecision(String prompt) async {
+  Future<Map<String, dynamic>?> _getAIDecision(String prompt,
+      {String? image}) async {
     try {
       // Prevent duplicate concurrent requests
       if (_llmRequestOngoing) {
@@ -880,8 +983,14 @@ Now analyze the current screen with fresh human-like intelligence and determine 
 
       _llmRequestOngoing = true;
       _lastLlmRequestedAt = DateTime.now();
-      print('🧠 Sending prompt to AI...');
-      final response = await _aiClient!.generateContent(prompt);
+      print('🧠 Sending prompt to AI${image != null ? ' (with image)' : ''}...');
+
+      String? response;
+      if (image != null) {
+        response = await _aiClient!.generateContentWithImage(prompt, image);
+      } else {
+        response = await _aiClient!.generateContent(prompt);
+      }
 
       if (response == null || response.isEmpty) {
         print('❌ Empty response from AI');
@@ -910,33 +1019,33 @@ Now analyze the current screen with fresh human-like intelligence and determine 
     }
   }
 
-  /// Extract JSON from AI response
+  /// Extract JSON from AI response, robustly handling thought blocks
   Map<String, dynamic>? _extractJsonFromResponse(String response) {
     try {
-      // Remove any markdown formatting
       String cleanResponse = response.trim();
 
-      // Remove ```json and ``` if present
-      if (cleanResponse.startsWith('```json')) {
-        cleanResponse = cleanResponse.substring(7);
-      }
-      if (cleanResponse.startsWith('```')) {
-        cleanResponse = cleanResponse.substring(3);
-      }
-      if (cleanResponse.endsWith('```')) {
-        cleanResponse = cleanResponse.substring(0, cleanResponse.length - 3);
+      // 1. Try to extract from json code block first (most reliable)
+      final codeBlockRegex = RegExp(r'```json\s*(\{[\s\S]*?\})\s*```');
+      final codeBlockMatch = codeBlockRegex.firstMatch(cleanResponse);
+      
+      if (codeBlockMatch != null) {
+        final jsonStr = codeBlockMatch.group(1);
+        if (jsonStr != null) {
+          return jsonDecode(jsonStr) as Map<String, dynamic>;
+        }
       }
 
-      // Find JSON object
+      // 2. Fallback: Find the first/last brace pair that looks like a JSON object
       final startIndex = cleanResponse.indexOf('{');
       final endIndex = cleanResponse.lastIndexOf('}');
 
-      if (startIndex == -1 || endIndex == -1 || startIndex >= endIndex) {
-        return null;
+      if (startIndex != -1 && endIndex != -1 && startIndex < endIndex) {
+        final jsonStr = cleanResponse.substring(startIndex, endIndex + 1);
+        return jsonDecode(jsonStr) as Map<String, dynamic>;
       }
 
-      final jsonString = cleanResponse.substring(startIndex, endIndex + 1).trim();
-      return jsonDecode(jsonString) as Map<String, dynamic>;
+      print('❌ No valid JSON found in response');
+      return null;
     } catch (e) {
       print('❌ JSON parsing error: $e');
       return null;
@@ -984,10 +1093,35 @@ Now analyze the current screen with fresh human-like intelligence and determine 
             _classifyInteractionType(action ?? '', parameters, description),
       });
 
-      // If LLM marked complete, only end after action attempt
+      // If action failed, treating it as a step failure for retry logic
+      if (!success && !isComplete) {
+        print('❌ Action failed logically: $action');
+        _stepRetryCount++;
+        _lastError = 'Action returned failure (false). Check logs for details.';
+        _lastFailedAction = action;
+
+        if (_stepRetryCount >= 3) {
+           _notifyError('Step continuously failed after 3 retries.');
+           _stepRetryCount = 0;
+           _lastError = null;
+           _lastFailedAction = null;
+           return false; // Stop finally
+        }
+        
+        // Wait and RETRY (continue loop)
+        await Future.delayed(const Duration(seconds: 2));
+        return true; 
+      }
+
+      // Reset retry state on successful action
+      _stepRetryCount = 0;
+      _lastError = null;
+      _lastFailedAction = null;
+
+      // If LLM marked complete, validation passed
       if (isComplete) {
         // Task completion - send final status as JSON
-        // When LLM marks is_complete=true, the task is considered successful
+        // When LLM marking complete means task succeeded
         final completionStatus = {
           'task_completed': true,
           'success': true, // LLM marking complete means task succeeded
@@ -1001,10 +1135,29 @@ Now analyze the current screen with fresh human-like intelligence and determine 
         return false;
       }
 
+      // Reset retry state on successful action
+      _stepRetryCount = 0;
+      _lastError = null;
+      _lastFailedAction = null;
+
       return success;
     } catch (e) {
-      _notifyError('Failed to process AI decision: $e');
-      return false;
+      print('❌ Error executing AI decision: $e');
+      _stepRetryCount++;
+      _lastError = e.toString();
+      _lastFailedAction = decision['action'];
+      
+      if (_stepRetryCount >= 3) {
+        _notifyError('Step failed after 3 retries: $e');
+        _stepRetryCount = 0;
+        _lastError = null; // Clear error after max retries
+        _lastFailedAction = null;
+        return false; // Stop automation loop
+      }
+      
+      // Wait before retry
+      await Future.delayed(const Duration(seconds: 2));
+      return true; // Continue automation loop to retry
     }
   }
 
@@ -1132,8 +1285,245 @@ Now analyze the current screen with fresh human-like intelligence and determine 
     return 'general_action';
   }
 
-  /// Find exact element from accessibility tree
+  /// Calculate Levenshtein distance for fuzzy matching
+  int _levenshteinDistance(String s1, String s2) {
+    if (s1 == s2) return 0;
+    if (s1.isEmpty) return s2.length;
+    if (s2.isEmpty) return s1.length;
+
+    List<int> v0 = List<int>.filled(s2.length + 1, 0);
+    List<int> v1 = List<int>.filled(s2.length + 1, 0);
+
+    for (int i = 0; i < s2.length + 1; i++) v0[i] = i;
+
+    for (int i = 0; i < s1.length; i++) {
+      v1[0] = i + 1;
+      for (int j = 0; j < s2.length; j++) {
+        int cost = (s1.codeUnitAt(i) == s2.codeUnitAt(j)) ? 0 : 1;
+        v1[j + 1] = [v1[j] + 1, v0[j + 1] + 1, v0[j] + cost]
+            .reduce((a, b) => a < b ? a : b);
+      }
+      for (int j = 0; j < s2.length + 1; j++) v0[j] = v1[j];
+    }
+    return v1[s2.length];
+  }
+
+  /// Check if text matches fuzzily
+  bool _isFuzzyMatch(String text, String target) {
+    final t = text.toLowerCase().trim();
+    final tg = target.toLowerCase().trim();
+    if (t.contains(tg) || tg.contains(t)) return true;
+    
+    // Allow for small typos (20% length tolerance)
+    final dist = _levenshteinDistance(t, tg);
+    final maxLength = t.length > tg.length ? t.length : tg.length;
+    if (maxLength == 0) return false;
+    
+    return dist <= (maxLength * 0.2).ceil();
+  }
+
+  /// Find best matching OCR result with hierarchical search
+  /// Priority: Element (word) → Line → Block (paragraph)
+  /// Returns a map with 'text', 'boundingBox', and 'level' (element/line/block)
+  Map<String, dynamic>? _findBestOcrMatch(List ocrBlocks, String targetText) {
+    if (ocrBlocks.isEmpty) return null;
+    
+    final target = targetText.trim().toLowerCase();
+    
+    // 1. Search at ELEMENT (word) level - highest precision
+    for (final block in ocrBlocks) {
+      if (block is! Map) continue;
+      final lines = block['lines'];
+      if (lines is! List) continue;
+      
+      for (final line in lines) {
+        if (line is! Map) continue;
+        final elements = line['elements'];
+        if (elements is! List) continue;
+        
+        for (final element in elements) {
+          if (element is! Map) continue;
+          final text = element['text']?.toString().trim().toLowerCase() ?? '';
+          
+          // Exact match at word level
+          if (text == target) {
+            return {
+              ...Map<String, dynamic>.from(element),
+              'level': 'element',
+              'matchType': 'exact'
+            };
+          }
+        }
+      }
+    }
+    
+    // 2. Fuzzy search at ELEMENT level
+    for (final block in ocrBlocks) {
+      if (block is! Map) continue;
+      final lines = block['lines'];
+      if (lines is! List) continue;
+      
+      for (final line in lines) {
+        if (line is! Map) continue;
+        final elements = line['elements'];
+        if (elements is! List) continue;
+        
+        for (final element in elements) {
+          if (element is! Map) continue;
+          final text = element['text']?.toString() ?? '';
+          
+          if (_isFuzzyMatch(text, targetText)) {
+            return {
+              ...Map<String, dynamic>.from(element),
+              'level': 'element',
+              'matchType': 'fuzzy'
+            };
+          }
+        }
+      }
+    }
+    
+    // 3. Search at LINE level
+    for (final block in ocrBlocks) {
+      if (block is! Map) continue;
+      final lines = block['lines'];
+      if (lines is! List) continue;
+      
+      for (final line in lines) {
+        if (line is! Map) continue;
+        final text = line['text']?.toString().trim().toLowerCase() ?? '';
+        
+        if (text == target || text.contains(target)) {
+          return {
+            ...Map<String, dynamic>.from(line),
+            'level': 'line',
+            'matchType': text == target ? 'exact' : 'contains'
+          };
+        }
+      }
+    }
+    
+    // 4. Fuzzy search at LINE level
+    for (final block in ocrBlocks) {
+      if (block is! Map) continue;
+      final lines = block['lines'];
+      if (lines is! List) continue;
+      
+      for (final line in lines) {
+        if (line is! Map) continue;
+        final text = line['text']?.toString() ?? '';
+        
+        if (_isFuzzyMatch(text, targetText)) {
+          return {
+            ...Map<String, dynamic>.from(line),
+            'level': 'line',
+            'matchType': 'fuzzy'
+          };
+        }
+      }
+    }
+    
+    // 5. Search at BLOCK level (fallback - least precise)
+    for (final block in ocrBlocks) {
+      if (block is! Map) continue;
+      final text = block['text']?.toString().trim().toLowerCase() ?? '';
+      
+      if (text == target || text.contains(target)) {
+        return {
+          ...Map<String, dynamic>.from(block),
+          'level': 'block',
+          'matchType': text == target ? 'exact' : 'contains'
+        };
+      }
+    }
+    
+    // 6. Fuzzy at BLOCK level
+    for (final block in ocrBlocks) {
+      if (block is! Map) continue;
+      final text = block['text']?.toString() ?? '';
+      
+      if (_isFuzzyMatch(text, targetText)) {
+        return {
+          ...Map<String, dynamic>.from(block),
+          'level': 'block',
+          'matchType': 'fuzzy'
+        };
+      }
+    }
+
+    return null;
+  }
+
+  /// Legacy wrapper for backward compatibility
+  Map<String, dynamic>? _findBestOcrBlock(List ocrBlocks, String targetText) {
+    return _findBestOcrMatch(ocrBlocks, targetText);
+  }
+
+  /// Get bounds from OCR result (works for block, line, or element)
+  Map<String, dynamic> _getBoundsFromOcrBlock(Map<String, dynamic> block) {
+    // New structure: boundingBox is a map with left, top, right, bottom, centerX, centerY
+    if (block.containsKey('boundingBox')) {
+      final bb = block['boundingBox'];
+      if (bb is Map) {
+        return {
+          'left': (bb['left'] as num?)?.toDouble() ?? 0.0,
+          'top': (bb['top'] as num?)?.toDouble() ?? 0.0,
+          'right': (bb['right'] as num?)?.toDouble() ?? 0.0,
+          'bottom': (bb['bottom'] as num?)?.toDouble() ?? 0.0,
+          'width': (bb['width'] as num?)?.toDouble() ?? 0.0,
+          'height': (bb['height'] as num?)?.toDouble() ?? 0.0,
+          'centerX': (bb['centerX'] as num?)?.toDouble() ?? 0.0,
+          'centerY': (bb['centerY'] as num?)?.toDouble() ?? 0.0,
+        };
+      }
+    }
+    
+    // Legacy structure: rect or frame
+    if (block.containsKey('rect')) {
+       return Map<String, dynamic>.from(block['rect']);
+    }
+    if (block.containsKey('frame')) {
+       return Map<String, dynamic>.from(block['frame']);
+    }
+    
+    // Flat properties fallback
+    return {
+       'left': (block['left'] as num?)?.toDouble() ?? 0.0,
+       'top': (block['top'] as num?)?.toDouble() ?? 0.0,
+       'right': (block['right'] as num?)?.toDouble() ?? 0.0,
+       'bottom': (block['bottom'] as num?)?.toDouble() ?? 0.0,
+    };
+  }
+
+  /// Get center from bounds - now uses centerX/centerY if available
+  Map<String, double> _getCenterFromBounds(Map<String, dynamic> bounds) {
+      // Use pre-computed center if available (from enhanced OCR)
+      if (bounds.containsKey('centerX') && bounds.containsKey('centerY')) {
+        final cx = (bounds['centerX'] as num?)?.toDouble();
+        final cy = (bounds['centerY'] as num?)?.toDouble();
+        if (cx != null && cy != null && cx > 0 && cy > 0) {
+          return {'x': cx, 'y': cy};
+        }
+      }
+      
+      // Fallback to manual calculation
+      final left = (bounds['left'] as num?)?.toDouble() ?? 0.0;
+      final top = (bounds['top'] as num?)?.toDouble() ?? 0.0;
+      final right = (bounds['right'] as num?)?.toDouble() ?? 0.0;
+      final bottom = (bounds['bottom'] as num?)?.toDouble() ?? 0.0;
+      
+      // If width/height are provided
+      final width = (bounds['width'] as num?)?.toDouble() ?? (right - left);
+      final height = (bounds['height'] as num?)?.toDouble() ?? (bottom - top);
+      
+      return {
+        'x': left + width / 2,
+        'y': top + height / 2,
+      };
+  }
+
   Map<String, dynamic>? _findElementByText(List elements, String targetText) {
+    // First pass: Exact match (case-insensitive)
     for (int i = 0; i < elements.length; i++) {
       try {
         final element = elements[i];
@@ -1142,8 +1532,24 @@ Now analyze the current screen with fresh human-like intelligence and determine 
           final text = elementMap['text']?.toString() ?? '';
           final contentDesc = elementMap['contentDescription']?.toString() ?? '';
 
-          if (text.toLowerCase().contains(targetText.toLowerCase()) ||
-              contentDesc.toLowerCase().contains(targetText.toLowerCase())) {
+          if (text.toLowerCase() == targetText.toLowerCase() ||
+              contentDesc.toLowerCase() == targetText.toLowerCase()) {
+            return {...elementMap, 'index': i, 'matched_text': text.isNotEmpty ? text : contentDesc};
+          }
+        }
+      } catch (_) {}
+    }
+
+    // Second pass: Fuzzy / Contains match
+    for (int i = 0; i < elements.length; i++) {
+      try {
+        final element = elements[i];
+        if (element is Map) {
+          final elementMap = Map<String, dynamic>.from(element);
+          final text = elementMap['text']?.toString() ?? '';
+          final contentDesc = elementMap['contentDescription']?.toString() ?? '';
+
+          if (_isFuzzyMatch(text, targetText) || _isFuzzyMatch(contentDesc, targetText)) {
             return {
               ...elementMap,
               'index': i,
@@ -1399,18 +1805,52 @@ Now analyze the current screen with fresh human-like intelligence and determine 
         return true;
       }
 
-      // Handle precise element actions first
-      if (action == 'tap_element_by_text') {
-        final text = parameters['text'] as String?;
-        if (text == null || text.isEmpty) {
-          _notifyMessage('❌ No text specified for element tap');
+      // ===== AI VISION TAP (LLM provides pixel coordinates) =====
+      if (action == 'tap_vision') {
+        var x = (parameters['x'] as num?)?.toDouble();
+        var y = (parameters['y'] as num?)?.toDouble();
+        final description = parameters['description'] as String? ?? 'Vision tap';
+        
+        if (x == null || y == null) {
+          _notifyMessage('❌ tap_vision requires x and y coordinates');
           return false;
         }
 
-        // Use latest captured elements to avoid duplicate tool calls
-        final elements = _getElementsFromLastContext();
+        // Convert normalized coordinates (0-1000) to device pixels
+        final w = (_lastContext?['ocr_image_width'] as num?)?.toDouble() ?? 0.0;
+        final h = (_lastContext?['ocr_image_height'] as num?)?.toDouble() ?? 0.0;
+        
+        if (w > 0 && h > 0) {
+             _notifyMessage('📏 Normalizing tap: ($x, $y)');
+             x = (x / 1000.0) * w;
+             y = (y / 1000.0) * h;
+             _notifyMessage('📍 Converted to pixels: (${x!.round()}, ${y!.round()}) for screen ${w.round()}x${h.round()}');
+        } else {
+             _notifyMessage('⚠️ Missing screen dimensions, using raw coordinates (risk of error)');
+        }
+        
+        _notifyMessage('👁️ Vision tap: "$description" at (${x!.round()}, ${y!.round()})');
+        final result = await ToolsManager.executeTool('perform_tap', {'x': x, 'y': y});
+        return result['success'] == true;
+      }
 
-        return await _executePreciseElementTap(text, elements);
+      if (action.startsWith('tap_element_by_text') || action == 'find_and_click') {
+        final context = _lastContext;
+        if (context == null) return false;
+        
+        final elements = context['screen_elements'] as List? ?? [];
+        final targetText = parameters['text'] as String? ?? '';
+        
+        bool success = await _executePreciseElementTap(targetText, elements);
+        
+        // Automatic Fallback: Vision/OCR
+        if (!success) {
+           print('⚠️ Accessibility tap failed for "$targetText". Trying OCR/Vision fallback...');
+           _notifyMessage('👁️ Accessibility tap failed. Trying Vision match...');
+           success = await _executeAction('tap_ocr_text', {'text': targetText});
+        }
+        
+        return success;
       }
 
       if (action == 'tap_element_by_index') {
@@ -1440,10 +1880,18 @@ Now analyze the current screen with fresh human-like intelligence and determine 
         return await _executePreciseElementTapByBounds(bounds, elements);
       }
 
-      // Ensure input focus before typing by tapping OCR-detected input/search if needed
+      // Ensure input focus before typing - Vision mode uses tap→blind type flow
       if (action == 'type_text' || action == 'advanced_type_text') {
-        final textToType = parameters['text']?.toString() ?? '';
-        await _ensureInputFocusBeforeTyping(textToType, force: true);
+        final isVisionMode = _lastContext?['vision_fallback_active'] == true;
+        if (!isVisionMode) {
+          // Normal mode: use accessibility-based focus detection
+          final textToType = parameters['text']?.toString() ?? '';
+          await _ensureInputFocusBeforeTyping(textToType, force: true);
+        } else {
+          // Vision mode: tap input field via OCR first, then blind type
+          _notifyMessage('👁️ Vision mode: Tap input → Blind type');
+          await _visionModeTapInputField();
+        }
       }
 
       // OCR-based actions (use when relying on OCR text/regions)
@@ -1487,11 +1935,16 @@ Now analyze the current screen with fresh human-like intelligence and determine 
           return false;
         }
 
+        // Log match precision level
+        final level = block['level'] ?? 'block';
+        final matchType = block['matchType'] ?? 'unknown';
+        
         final bounds = _getBoundsFromOcrBlock(block);
         final coords = _getCenterFromBounds(bounds);
-        _notifyMessage('🎯 OCR tap on "$text" at (${coords['x']!.round()}, ${coords['y']!.round()})');
+        _notifyMessage('🎯 OCR tap [$level/$matchType] on "$text" at (${coords['x']!.round()}, ${coords['y']!.round()})');
         final result = await ToolsManager.executeTool('perform_tap', { 'x': coords['x'], 'y': coords['y'] });
         return result['success'] == true;
+
       }
 
       if (action == 'tap_ocr_bounds') {
@@ -1506,10 +1959,89 @@ Now analyze the current screen with fresh human-like intelligence and determine 
         return result['success'] == true;
       }
 
+      // Catch perform_swipe with 'direction' parameter (AI hallucination fix)
+      if (action == 'perform_swipe' && parameters.containsKey('direction') && !parameters.containsKey('startX')) {
+        final direction = parameters['direction']?.toString().toLowerCase() ?? 'left';
+        _notifyMessage('🔄 converting directional swipe "$direction" to coordinates');
+        
+        // Get screen dimensions
+        final w = (_lastContext?['ocr_image_width'] as num?)?.toDouble() ?? 
+                  (_lastContext?['vision_image_width'] as num?)?.toDouble() ?? 1080.0;
+        final h = (_lastContext?['ocr_image_height'] as num?)?.toDouble() ?? 2400.0;
+        
+        final centerX = w / 2;
+        final centerY = h / 2;
+        // Swipe distance: 1/3 of the smaller dimension
+        final distance = (w < h ? w : h) / 3;
+        
+        double startX = centerX;
+        double startY = centerY;
+        double endX = centerX;
+        double endY = centerY;
+        
+        switch (direction) {
+          case 'left':
+            // Swipe Left: Finger moves Right -> Left (Content moves Right?? No, Swipe Left usually means "Next Page" or "Go Right")
+            // Wait, "Swipe Left" generally means dragging finger FROM Right TO Left.
+            startX = centerX + distance;
+            endX = centerX - distance;
+            break;
+          case 'right':
+            // Swipe Right: Finger moves Left -> Right
+            startX = centerX - distance;
+            endX = centerX + distance;
+            break;
+          case 'up':
+            // Swipe Up: Finger moves Down -> Up (Scroll Down)
+            startY = centerY + distance;
+            endY = centerY - distance;
+            break;
+          case 'down':
+            // Swipe Down: Finger moves Up -> Down (Scroll Up)
+            startY = centerY - distance;
+            endY = centerY + distance;
+            break;
+        }
+        
+        parameters['startX'] = startX;
+        parameters['startY'] = startY;
+        parameters['endX'] = endX;
+        parameters['endY'] = endY;
+        parameters['duration'] = 300; // Standard swipe duration
+      }
+
       // Check if action is available
       if (!ToolsManager.isToolAvailable(action)) {
         _notifyMessage('❌ Action not available: $action');
         return false;
+      }
+
+      if (action == 'perform_grouped_taps') {
+        final taps = parameters['taps'] as List?;
+        if (taps != null) {
+          // Convert normalized coordinates (0-1000) to device pixels for grouped taps
+          final w = (_lastContext?['ocr_image_width'] as num?)?.toDouble() ?? 0.0;
+          final h = (_lastContext?['ocr_image_height'] as num?)?.toDouble() ?? 0.0;
+          
+          if (w > 0 && h > 0) {
+            _notifyMessage('📏 Normalizing grouped taps to ${w.round()}x${h.round()}');
+            
+            final scaledTaps = <Map<String, dynamic>>[];
+            for (final tap in taps) {
+              if (tap is Map) {
+                final tx = (tap['x'] as num?)?.toDouble() ?? 0.0;
+                final ty = (tap['y'] as num?)?.toDouble() ?? 0.0;
+                scaledTaps.add({
+                  'x': (tx / 1000.0) * w,
+                  'y': (ty / 1000.0) * h
+                });
+              }
+            }
+            parameters['taps'] = scaledTaps;
+          }
+          
+          _notifyMessage('⌨️ executing grouped taps (${taps.length} taps) for vision typing');
+        }
       }
 
       // Execute the tool
@@ -1655,97 +2187,8 @@ Now analyze the current screen with fresh human-like intelligence and determine 
     return buffer.toString();
   }
 
-  Map<String, dynamic> _getBoundsFromOcrBlock(Map block) {
-    try {
-      if (block['boundingBox'] is Map) {
-        final bb = Map<String, dynamic>.from(block['boundingBox']);
-        return {
-          'left': (bb['left'] as num?)?.toDouble() ?? 0.0,
-          'top': (bb['top'] as num?)?.toDouble() ?? 0.0,
-          'right': (bb['right'] as num?)?.toDouble() ?? 0.0,
-          'bottom': (bb['bottom'] as num?)?.toDouble() ?? 0.0,
-        };
-      }
-    } catch (_) {}
-    return { 'left': 0.0, 'top': 0.0, 'right': 0.0, 'bottom': 0.0 };
-  }
 
-  Map<String, double> _getCenterFromBounds(Map bounds) {
-    final left = (bounds['left'] as num?)?.toDouble() ?? 0.0;
-    final top = (bounds['top'] as num?)?.toDouble() ?? 0.0;
-    final right = (bounds['right'] as num?)?.toDouble() ?? 0.0;
-    final bottom = (bounds['bottom'] as num?)?.toDouble() ?? 0.0;
-    double x = left + (right - left) / 2.0;
-    double y = top + (bottom - top) / 2.0;
-    // Normalize to device-screen coordinates if OCR image dimensions differ from screen
-    final screenDims = _estimateScreenSizeFromLastA11y();
-    final ocrW = (_lastContext?['ocr_image_width'] as num?)?.toDouble() ?? 0.0;
-    final ocrH = (_lastContext?['ocr_image_height'] as num?)?.toDouble() ?? 0.0;
-    if (screenDims != null && ocrW > 0 && ocrH > 0) {
-      final sx = screenDims['width'];
-      final sy = screenDims['height'];
-      if (sx != null && sy != null && sx > 0 && sy > 0) {
-        final scaleX = sx / ocrW;
-        final scaleY = sy / ocrH;
-        x = x * scaleX;
-        y = y * scaleY;
-      }
-    }
-    return { 'x': x, 'y': y };
-  }
 
-  Map<String, double>? _estimateScreenSizeFromLastA11y() {
-    try {
-      final a11y = _lastContext?['accessibility_tree'];
-      if (a11y is List && a11y.isNotEmpty) {
-        double maxRight = 0.0;
-        double maxBottom = 0.0;
-        for (final n in a11y) {
-          if (n is Map) {
-            final m = Map<String, dynamic>.from(n);
-            final b = m['bounds'];
-            if (b is Map) {
-              final right = (b['right'] as num?)?.toDouble() ?? 0.0;
-              final bottom = (b['bottom'] as num?)?.toDouble() ?? 0.0;
-              if (right > maxRight) maxRight = right;
-              if (bottom > maxBottom) maxBottom = bottom;
-            }
-          }
-        }
-        if (maxRight > 0 && maxBottom > 0) {
-          return {'width': maxRight, 'height': maxBottom};
-        }
-      }
-      return null;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  Map<String, dynamic>? _findBestOcrBlock(List blocks, String target) {
-    try {
-      final normTarget = _normalizeText(target);
-      Map<String, dynamic>? best;
-      double bestScore = 0.0;
-      for (final b in blocks) {
-        if (b is Map && b['text'] is String) {
-          final text = (b['text'] as String);
-          final score = _textMatchScore(_normalizeText(text), normTarget);
-          if (score > bestScore) {
-            bestScore = score;
-            best = Map<String, dynamic>.from(b);
-          }
-        }
-      }
-      // Require minimal score to avoid false taps
-      if (bestScore < 0.25) return null;
-      print('🔎 OCR match score=$bestScore for "$target"');
-      return best;
-    } catch (e) {
-      print('Error selecting OCR block: $e');
-      return null;
-    }
-  }
 
   String _normalizeText(String s) {
     return s.toLowerCase().replaceAll(RegExp(r'\s+'), ' ').trim();
@@ -1899,6 +2342,75 @@ Now analyze the current screen with fresh human-like intelligence and determine 
         }
       }
     } catch (_) {}
+  }
+
+  /// Vision mode: tap on input field using OCR before blind typing
+  /// Finds search bars, input fields, or text fields via OCR and taps them
+  Future<void> _visionModeTapInputField() async {
+    try {
+      // Get OCR blocks from last context
+      final ctx = _lastContext ?? <String, dynamic>{};
+      List blocks = (ctx['ocr_blocks'] is List) ? List.from(ctx['ocr_blocks']) : <dynamic>[];
+      
+      // If no OCR blocks, try to capture fresh
+      if (blocks.isEmpty && ctx['screenshot_available'] == true) {
+        final ss = await ToolsManager.executeTool('take_screenshot', {});
+        if (ss['success'] == true && ss['data'] is String) {
+          final ocrRes = await ToolsManager.executeTool('perform_ocr', { 'screenshot': ss['data'] });
+          if (ocrRes['success'] == true && ocrRes['data'] is Map) {
+            final data = Map<String, dynamic>.from(ocrRes['data']);
+            blocks = (data['blocks'] is List) ? List.from(data['blocks']) : <dynamic>[];
+          }
+        }
+      }
+      
+      if (blocks.isEmpty) {
+        _notifyMessage('⚠️ No OCR data - typing blindly without tap');
+        return;
+      }
+      
+      // Search for input field cues in priority order
+      final inputCues = <String>['search', 'search for', 'type here', 'enter', 'write', 'message', 'ask', 'input'];
+      Map<String, dynamic>? bestMatch;
+      
+      for (final cue in inputCues) {
+        final match = _findBestOcrMatch(blocks, cue);
+        if (match != null) {
+          bestMatch = match;
+          break;
+        }
+      }
+      
+      // If no specific cue found, look for text that might be a placeholder
+      if (bestMatch == null) {
+        // Try to find any element with "..." which often indicates input placeholder
+        for (final block in blocks) {
+          if (block is! Map) continue;
+          final text = block['text']?.toString() ?? '';
+          if (text.contains('...') || text.toLowerCase().contains('search') || text.toLowerCase().contains('type')) {
+            bestMatch = Map<String, dynamic>.from(block);
+            break;
+          }
+        }
+      }
+      
+      if (bestMatch != null) {
+        final bounds = _getBoundsFromOcrBlock(bestMatch);
+        final center = _getCenterFromBounds(bounds);
+        final level = bestMatch['level'] ?? 'block';
+        final matchedText = bestMatch['text']?.toString() ?? '';
+        
+        _notifyMessage('👆 Vision tap on input: "$matchedText" [$level] at (${center['x']!.round()}, ${center['y']!.round()})');
+        await ToolsManager.executeTool('perform_tap', { 'x': center['x'], 'y': center['y'] });
+        
+        // Wait for keyboard to appear
+        await Future.delayed(const Duration(milliseconds: 500));
+      } else {
+        _notifyMessage('⚠️ No input field found via OCR - typing blindly');
+      }
+    } catch (e) {
+      _notifyMessage('⚠️ Vision tap failed: $e');
+    }
   }
 
   int _findFirstEditableIndex(List a11y) {

@@ -261,9 +261,9 @@ class SpeechToTextService : Service() {
                 Log.d(TAG, "STT result: $text")
                 
                 // Check if wake word is detected
-                if (text.lowercase().contains("hey droid") || 
-                    text.lowercase().contains("hey dude") ||
-                    text.lowercase().contains("droid")) {
+                if (text.lowercase().contains("Hey Bro") || 
+                    text.lowercase().contains("hey bro") ||
+                    text.lowercase().contains("bro")) {
                     Log.d(TAG, "Wake word detected: $text")
                     onWakeWordDetected(text)
                 } else {
@@ -286,9 +286,9 @@ class SpeechToTextService : Service() {
 
             override fun onPartialResult(partialText: String) {
                 // Check partial results for wake word as well
-                if (partialText.lowercase().contains("hey droid") || 
-                    partialText.lowercase().contains("hey dude") ||
-                    partialText.lowercase().contains("droid")) {
+                if (partialText.lowercase().contains("Hey Bro") || 
+                    partialText.lowercase().contains("hey bro") ||
+                    partialText.lowercase().contains("bro")) {
                     Log.d(TAG, "Wake word detected in partial result: $partialText")
                     onWakeWordDetected(partialText)
                 }

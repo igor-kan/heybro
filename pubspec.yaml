@@ -11,8 +11,11 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # HTTP client for Vertex AI API calls
+  # HTTP client (kept for other potential uses, though Gemini SDK handles its own requests)
   http: ^1.1.0
+
+  # Standard Gemini API SDK
+  google_generative_ai: ^0.4.4
 
   # JSON handling
   json_annotation: ^4.8.1
@@ -23,8 +26,7 @@ dependencies:
   # Cryptography utilities
   crypto: ^3.0.3
 
-  # JWT handling for service account authentication
-  jose: ^0.3.4
+
 
   # UI utilities
   cupertino_icons: ^1.0.2
@@ -40,6 +42,8 @@ dependencies:
 
   # SVG support
   flutter_svg: ^2.0.7
+  share_plus: ^12.0.1
+  path_provider: ^2.1.5
 
 dev_dependencies:
   flutter_test:

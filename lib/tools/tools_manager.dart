@@ -34,7 +34,7 @@ class ToolsManager {
       switch (toolName) {
         // Screen Capture & Analysis
         case 'take_screenshot':
-          return await _takeScreenshot();
+          return await _takeScreenshot(parameters);
         case 'get_accessibility_tree':
           return await _getAccessibilityTree();
         case 'get_screen_elements':
@@ -45,6 +45,8 @@ class ToolsManager {
           return await _performOcr(parameters);
         case 'get_current_app':
           return await _getCurrentApp();
+        case 'resize_image':
+          return await _resizeImage(parameters);
 
         // Touch Operations
         case 'perform_tap':
@@ -53,6 +55,8 @@ class ToolsManager {
           return await _performLongPress(parameters);
         case 'perform_double_click':
           return await _performDoubleClick(parameters);
+        case 'perform_grouped_taps':
+          return await _performGroupedTaps(parameters);
 
         // Precise Element Tapping
         case 'tap_element_by_text':
@@ -78,6 +82,7 @@ class ToolsManager {
         case 'perform_advanced_type':
           return await _performAdvancedType(parameters);
         case 'advanced_type_text':
+        case 'type_text':
           return await _advancedTypeText(parameters);
         case 'non_tap_text_input':
           return await _nonTapTextInput(parameters);
@@ -183,9 +188,11 @@ class ToolsManager {
 
   // ==================== SCREEN CAPTURE & ANALYSIS ====================
 
-  static Future<Map<String, dynamic>> _takeScreenshot() async {
+  static Future<Map<String, dynamic>> _takeScreenshot(
+      Map<String, dynamic> parameters) async {
     try {
-      final result = await _toolsChannel.invokeMethod('takeScreenshot');
+      final result =
+          await _toolsChannel.invokeMethod('takeScreenshot', parameters);
       return {'success': true, 'data': result, 'error': null};
     } catch (e) {
       return {
@@ -230,6 +237,45 @@ class ToolsManager {
       return {
         'success': false,
         'error': 'Failed to analyze screen: $e',
+        'data': null
+      };
+    }
+  }
+
+  static Future<Map<String, dynamic>> _resizeImage(
+      Map<String, dynamic> parameters) async {
+    try {
+      final base64Image = parameters['base64Image'] as String?;
+      final targetWidth = parameters['targetWidth'] as int? ?? 480;
+      final quality = parameters['quality'] as int? ?? 50;
+
+      if (base64Image == null || base64Image.isEmpty) {
+        return {
+          'success': false,
+          'error': 'Missing base64Image parameter',
+          'data': null
+        };
+      }
+
+      final result = await _toolsChannel.invokeMethod('resizeImage', {
+        'base64Image': base64Image,
+        'targetWidth': targetWidth,
+        'quality': quality,
+      });
+
+      if (result != null) {
+        return {'success': true, 'data': result, 'error': null};
+      } else {
+        return {
+          'success': false,
+          'error': 'Failed to resize image (result was null)',
+          'data': null
+        };
+      }
+    } catch (e) {
+      return {
+        'success': false,
+        'error': 'Error resizing image: $e',
         'data': null
       };
     }
@@ -322,6 +368,36 @@ class ToolsManager {
       return {
         'success': false,
         'error': 'Failed to perform double click: $e',
+        'data': null
+      };
+    }
+  }
+
+  static Future<Map<String, dynamic>> _performGroupedTaps(
+      Map<String, dynamic> parameters) async {
+    try {
+      final taps = parameters['taps'];
+      if (taps is! List) {
+        return {
+          'success': false, 
+          'error': 'Missing taps list parameter',
+          'data': null
+        };
+      }
+
+      final result = await _toolsChannel.invokeMethod('performGroupedTaps', {
+        'taps': taps,
+      });
+
+      return {
+        'success': result == true,
+        'data': null,
+        'error': result == true ? null : 'Grouped taps failed'
+      };
+    } catch (e) {
+      return {
+        'success': false,
+        'error': 'Failed to perform grouped taps: $e',
         'data': null
       };
     }
@@ -1250,6 +1326,7 @@ class ToolsManager {
       'perform_tap',
       'perform_long_press',
       'perform_double_click',
+      'perform_grouped_taps',
       'tap_element_by_text',
       'tap_element_by_index',
       'tap_element_by_bounds',
@@ -1265,6 +1342,7 @@ class ToolsManager {
       // Text Operations
       'perform_advanced_type',
       'advanced_type_text',
+      'type_text',
       'non_tap_text_input',
       'get_focused_input_info',
 
@@ -1332,7 +1410,8 @@ class ToolsManager {
          'perform_long_press',
          'tap_ocr_text',
          'tap_ocr_bounds',
-        'perform_double_click',
+         'perform_double_click',
+         'perform_grouped_taps',
         'perform_swipe',
         'perform_scroll',
         'perform_dynamic_scroll',
@@ -1422,6 +1501,7 @@ class ToolsManager {
        'tap_ocr_text': 'Tap using OCR-matched text block {"text": "..."}',
        'tap_ocr_bounds': 'Tap using explicit OCR bounds {"left","top","right","bottom"}',
       'perform_double_click': 'Double tap at specific coordinates',
+      'perform_grouped_taps': 'Perform multiple taps in sequence (e.g. for typing)',
 
       // Gestures
       'perform_swipe': 'Swipe from start coordinates to end coordinates',
@@ -1436,6 +1516,7 @@ class ToolsManager {
       // Text Operations
       'perform_advanced_type': 'Type text with advanced input method support',
       'advanced_type_text': 'Type text with options to clear first and add delays',
+      'type_text': 'Type text into the focused field',
       'non_tap_text_input': 'Inject text directly into input fields without tapping using AccessibilityService',
       'get_focused_input_info': 'Get information about the currently focused input field including ID, class, and text selection',
 

@@ -1,8 +1,7 @@
-import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'secure_storage.dart';
-import 'vertex_ai_client.dart';
+import 'gemini_client.dart';
 
 class ApiSettingsScreen extends StatefulWidget {
   const ApiSettingsScreen({super.key});
@@ -13,42 +12,27 @@ class ApiSettingsScreen extends StatefulWidget {
 
 class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
   final _formKey = GlobalKey<FormState>();
-  final _projectIdController = TextEditingController();
-  final _serviceAccountController = TextEditingController();
+  final _apiKeyController = TextEditingController();
+  final _customModelController = TextEditingController();
 
   final SecureStorage _secureStorage = SecureStorage();
-  final VertexAIClient _vertexAI = VertexAIClient();
+  final GeminiClient _geminiClient = GeminiClient();
 
-  String _selectedModel = 'gemini-2.5-pro';
-  String _selectedRegion = 'us-central1';
   bool _isLoading = false;
   bool _isTesting = false;
   String _statusMessage = '';
   Color _statusColor = Colors.grey;
-  bool _useServiceAccount = false;
-
-  final Map<String, List<String>> _regionModels = {
-    'asia-east1': ['gemini-2.5-pro', 'gemini-2.5-flash'],
-    'asia-east2': ['gemini-2.5-pro', 'gemini-2.5-flash'],
-    'asia-northeast1': ['gemini-2.5-pro', 'gemini-2.5-flash'],
-    'asia-northeast2': ['gemini-2.5-pro', 'gemini-2.5-flash'],
-    'asia-northeast3': ['gemini-2.5-pro', 'gemini-2.5-flash'],
-    'asia-south1': ['gemini-2.5-pro', 'gemini-2.5-flash'],
-    'asia-south2': ['gemini-2.5-pro', 'gemini-2.5-flash'],
-    'asia-southeast1': ['gemini-2.5-pro', 'gemini-2.5-flash'],
-    'asia-southeast2': ['gemini-2.5-pro', 'gemini-2.5-flash'],
-    'australia-southeast1': ['gemini-2.5-pro', 'gemini-2.5-flash'],
-    'australia-southeast2': ['gemini-2.5-pro', 'gemini-2.5-flash'],
-    'us-central1': ['gemini-2.5-pro', 'gemini-2.5-flash'],
-    'us-east1': ['gemini-2.5-pro', 'gemini-2.5-flash'],
-    'us-east4': ['gemini-2.5-pro', 'gemini-2.5-flash'],
-    'us-east5': ['gemini-2.5-pro', 'gemini-2.5-flash'],
-    'us-south1': ['gemini-2.5-pro', 'gemini-2.5-flash'],
-    'us-west1': ['gemini-2.5-pro', 'gemini-2.5-flash'],
-    'us-west2': ['gemini-2.5-pro', 'gemini-2.5-flash'],
-    'us-west3': ['gemini-2.5-pro', 'gemini-2.5-flash'],
-    'us-west4': ['gemini-2.5-pro', 'gemini-2.5-flash'],
-  };
+  
+  String _selectedModel = 'gemini-2.5-flash';
+  bool _isCustomModel = false;
+  
+  final List<String> _commonModels = [
+    'gemini-2.5-flash',
+    'gemini-2.5-pro',
+    'gemini-3-pro-preview',
+    'gemini-3-flash-preview',
+    'Custom'
+  ];
 
   @override
   void initState() {
@@ -67,8 +51,8 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
 
   @override
   void dispose() {
-    _projectIdController.dispose();
-    _serviceAccountController.dispose();
+    _apiKeyController.dispose();
+    _customModelController.dispose();
     super.dispose();
   }
 
@@ -77,23 +61,19 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
     try {
       final config = await _secureStorage.getApiConfiguration();
       if (config != null) {
-        _projectIdController.text = config.projectId;
-        setState(() {
-          if (_regionModels.containsKey(config.region)) {
-            _selectedRegion = config.region;
-          } else {
-            _selectedRegion = 'us-central1';
-          }
-          
-          if (_regionModels[_selectedRegion]?.contains(config.modelId) == true) {
-            _selectedModel = config.modelId;
-          } else {
-            _selectedModel = _regionModels[_selectedRegion]?.first ?? 'gemini-2.5-pro';
-          }
-          _useServiceAccount = config.serviceAccountJson?.isNotEmpty == true;
-        });
-        if (config.serviceAccountJson?.isNotEmpty == true) {
-          _serviceAccountController.text = config.serviceAccountJson!;
+        if (config.apiKey.isNotEmpty) {
+          _apiKeyController.text = config.apiKey;
+        }
+        
+        if (config.modelId.isNotEmpty) {
+           if (_commonModels.contains(config.modelId)) {
+             _selectedModel = config.modelId;
+             _isCustomModel = false;
+           } else {
+             _selectedModel = 'Custom';
+             _isCustomModel = true;
+             _customModelController.text = config.modelId;
+           }
         }
       }
     } catch (e) {
@@ -110,23 +90,40 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
     });
   }
 
+  String get _effectiveModelId {
+    if (_isCustomModel) {
+      return _customModelController.text.trim();
+    }
+    return _selectedModel;
+  }
+
   Future<void> _saveConfiguration() async {
     if (!_formKey.currentState!.validate()) return;
+    
+    final modelId = _effectiveModelId;
+    if (modelId.isEmpty) {
+       _setStatus('Please specify a model ID', Colors.orange);
+       return;
+    }
 
     setState(() => _isLoading = true);
     _setStatus('Saving configuration...', Colors.blue);
 
     try {
-      // Ensure storage is initialized before saving
       await _secureStorage.initialize();
       
       await _secureStorage.saveApiConfiguration(
-        projectId: _projectIdController.text.trim(),
-        region: _selectedRegion,
-        modelId: _selectedModel,
-        serviceAccountJson: _useServiceAccount ? _serviceAccountController.text.trim() : '',
+        projectId: 'gemini-standard',
+        region: 'us-central1',
+        modelId: modelId, 
+        apiKey: _apiKeyController.text.trim(),
+        serviceAccountJson: null,
       );
-      _setStatus('Configuration saved successfully!', const Color(0xFF4CAF50));
+      
+      // Update client immediately
+      _geminiClient.updateConfiguration(_apiKeyController.text.trim(), modelId);
+      
+      _setStatus('Configuration saved!', const Color(0xFF4CAF50));
     } catch (e) {
       _setStatus('Error saving configuration: $e', Colors.red);
     } finally {
@@ -136,36 +133,30 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
 
   Future<void> _testConnection() async {
     if (!_formKey.currentState!.validate()) {
-      _setStatus('Please fill in all required fields', Colors.orange);
+      _setStatus('Please enter an API Key', Colors.orange);
       return;
+    }
+    
+    final modelId = _effectiveModelId;
+    if (modelId.isEmpty) {
+       _setStatus('Please specify a model ID', Colors.orange);
+       return;
     }
 
     setState(() => _isTesting = true);
     _setStatus('Testing connection...', Colors.blue);
 
     try {
-      // Ensure storage is initialized before saving
-      await _secureStorage.initialize();
+      // Set key and model on client to test
+      _geminiClient.updateConfiguration(_apiKeyController.text.trim(), modelId);
       
-      // First save the configuration, then test
-      await _secureStorage.saveApiConfiguration(
-        projectId: _projectIdController.text.trim(),
-        region: _selectedRegion,
-        modelId: _selectedModel,
-        serviceAccountJson: _useServiceAccount ? _serviceAccountController.text.trim() : '',
-      );
-      
-      // Reinitialize the client with new config
-      await _vertexAI.initialize();
-      
-      // Test the connection
-      final success = await _vertexAI.testConnection();
+      final success = await _geminiClient.testConnection();
       if (!success) {
         throw Exception('Connection test failed');
       }
-      _setStatus('Connection test successful!', const Color(0xFF4CAF50));
+      _setStatus('Test successful!', const Color(0xFF4CAF50));
     } catch (e) {
-      _setStatus('Connection test failed: $e', Colors.red);
+      _setStatus('Test failed: $e', Colors.red);
     } finally {
       setState(() => _isTesting = false);
     }
@@ -175,7 +166,7 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
     try {
       final clipboardData = await Clipboard.getData(Clipboard.kTextPlain);
       if (clipboardData?.text != null) {
-        _serviceAccountController.text = clipboardData!.text!;
+        _apiKeyController.text = clipboardData!.text!;
         _setStatus('Pasted from clipboard', const Color(0xFF4CAF50));
       }
     } catch (e) {
@@ -183,9 +174,9 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
     }
   }
 
-  void _clearServiceAccount() {
-    _serviceAccountController.clear();
-    _setStatus('Service account cleared', Colors.grey);
+  void _clearField() {
+    _apiKeyController.clear();
+    _setStatus('Cleared', Colors.grey);
   }
 
   Widget _buildPillButton({
@@ -318,7 +309,7 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
           onPressed: () => Navigator.of(context).pop(),
         ),
         title: const Text(
-          'API Settings',
+          'Gemini API Settings',
           style: TextStyle(
             color: Color(0xFF2E7D32),
             fontWeight: FontWeight.w700,
@@ -342,7 +333,7 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
                   children: [
                     // Header
                     Text(
-                      'Google Cloud Vertex AI',
+                      'Google Gemini API',
                       style: TextStyle(
                         fontSize: isTablet ? 28 : 24,
                         fontWeight: FontWeight.w700,
@@ -351,7 +342,7 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
                     ),
                     SizedBox(height: isTablet ? 8 : 6),
                     Text(
-                      'Configure your AI model settings',
+                      'Configure API key and model',
                       style: TextStyle(
                         fontSize: isTablet ? 16 : 14,
                         color: Colors.grey[600],
@@ -360,9 +351,9 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
                     ),
                     SizedBox(height: isTablet ? 40 : 32),
 
-                    // Project ID
+                    // API Key Field
                     Text(
-                      'Project ID',
+                      'API Key',
                       style: TextStyle(
                         fontSize: isTablet ? 18 : 16,
                         fontWeight: FontWeight.w600,
@@ -371,9 +362,9 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
                     ),
                     SizedBox(height: isTablet ? 12 : 8),
                     TextFormField(
-                      controller: _projectIdController,
+                      controller: _apiKeyController,
                       decoration: InputDecoration(
-                        hintText: 'Enter your Google Cloud Project ID',
+                        hintText: 'Paste your Gemini API Key here',
                         border: OutlineInputBorder(
                           borderRadius: BorderRadius.circular(12),
                           borderSide: const BorderSide(color: Color(0xFFE0E0E0)),
@@ -387,61 +378,42 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
                           vertical: isTablet ? 20 : 16,
                         ),
                       ),
+                      maxLines: 2,
                       validator: (value) {
-                        if (value == null || value.trim().isEmpty) {
-                          return 'Project ID is required';
-                        }
-                        return null;
+                         if (value == null || value.trim().isEmpty) {
+                           return 'API Key is required';
+                         }
+                         return null;
                       },
                     ),
-                    SizedBox(height: isTablet ? 32 : 24),
-
-                    // Region Selection
-                    Text(
-                      'Region',
-                      style: TextStyle(
-                        fontSize: isTablet ? 18 : 16,
-                        fontWeight: FontWeight.w600,
-                        color: const Color(0xFF2E7D32),
-                      ),
+                    SizedBox(height: isTablet ? 16 : 12),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: _buildPillButton(
+                            text: 'Paste',
+                            onPressed: _pasteFromClipboard,
+                            isPrimary: false,
+                            icon: Icons.paste,
+                          ),
+                        ),
+                        SizedBox(width: isTablet ? 16 : 12),
+                        Expanded(
+                          child: _buildPillButton(
+                            text: 'Clear',
+                            onPressed: _clearField,
+                            isPrimary: false,
+                            icon: Icons.clear,
+                          ),
+                        ),
+                      ],
                     ),
-                    SizedBox(height: isTablet ? 12 : 8),
-                    DropdownButtonFormField<String>(
-                      value: _selectedRegion,
-                      decoration: InputDecoration(
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(12),
-                          borderSide: const BorderSide(color: Color(0xFFE0E0E0)),
-                        ),
-                        focusedBorder: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(12),
-                          borderSide: const BorderSide(color: Color(0xFF4CAF50), width: 2),
-                        ),
-                        contentPadding: EdgeInsets.symmetric(
-                          horizontal: isTablet ? 20 : 16,
-                          vertical: isTablet ? 20 : 16,
-                        ),
-                      ),
-                      items: _regionModels.keys.map((region) {
-                        return DropdownMenuItem(
-                          value: region,
-                          child: Text(region),
-                        );
-                      }).toList(),
-                      onChanged: (value) {
-                        if (value != null) {
-                          setState(() {
-                            _selectedRegion = value;
-                            _selectedModel = _regionModels[value]?.first ?? 'gemini-2.5-pro';
-                          });
-                        }
-                      },
-                    ),
-                    SizedBox(height: isTablet ? 32 : 24),
 
+                    SizedBox(height: isTablet ? 32 : 24),
+                    
                     // Model Selection
                     Text(
-                      'AI Model',
+                      'Model',
                       style: TextStyle(
                         fontSize: isTablet ? 18 : 16,
                         fontWeight: FontWeight.w600,
@@ -450,7 +422,8 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
                     ),
                     SizedBox(height: isTablet ? 12 : 8),
                     DropdownButtonFormField<String>(
-                      value: _selectedModel,
+                      // Ensure value is valid to prevent crashes
+                      value: _commonModels.contains(_selectedModel) ? _selectedModel : _commonModels.first,
                       decoration: InputDecoration(
                         border: OutlineInputBorder(
                           borderRadius: BorderRadius.circular(12),
@@ -465,67 +438,33 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
                           vertical: isTablet ? 20 : 16,
                         ),
                       ),
-                      items: (_regionModels[_selectedRegion] ?? []).map((model) {
+                      items: _commonModels.map((model) {
                         return DropdownMenuItem(
                           value: model,
                           child: Text(model),
                         );
                       }).toList(),
                       onChanged: (value) {
-                        if (value != null) {
-                          setState(() {
-                            _selectedModel = value;
-                          });
-                        }
+                         if (value != null) {
+                           setState(() {
+                             _selectedModel = value;
+                             _isCustomModel = value == 'Custom';
+                             if (!_isCustomModel) {
+                               _customModelController.clear();
+                             }
+                           });
+                         }
                       },
                     ),
-                    SizedBox(height: isTablet ? 32 : 24),
-
-                    // Service Account Toggle
-                    Row(
-                      children: [
-                        Switch(
-                          value: _useServiceAccount,
-                          onChanged: (value) {
-                            setState(() {
-                              _useServiceAccount = value;
-                              if (!value) {
-                                _serviceAccountController.clear();
-                              }
-                            });
-                          },
-                          activeColor: const Color(0xFF4CAF50),
-                        ),
-                        SizedBox(width: isTablet ? 16 : 12),
-                        Expanded(
-                          child: Text(
-                            'Use Service Account JSON',
-                            style: TextStyle(
-                              fontSize: isTablet ? 18 : 16,
-                              fontWeight: FontWeight.w600,
-                              color: const Color(0xFF2E7D32),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-
-                    // Service Account JSON Field
-                    if (_useServiceAccount) ...[
-                      SizedBox(height: isTablet ? 24 : 16),
-                      Text(
-                        'Service Account JSON',
-                        style: TextStyle(
-                          fontSize: isTablet ? 18 : 16,
-                          fontWeight: FontWeight.w600,
-                          color: const Color(0xFF2E7D32),
-                        ),
-                      ),
-                      SizedBox(height: isTablet ? 12 : 8),
-                      TextFormField(
-                        controller: _serviceAccountController,
+                    
+                    if (_isCustomModel) ...[
+                      SizedBox(height: isTablet ? 16 : 12),
+                      Text("Enter Custom Model ID:"),
+                      SizedBox(height: 8),
+                       TextFormField(
+                        controller: _customModelController,
                         decoration: InputDecoration(
-                          hintText: 'Paste your service account JSON here',
+                          hintText: 'e.g. gemini-1.5-pro-002',
                           border: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(12),
                             borderSide: const BorderSide(color: Color(0xFFE0E0E0)),
@@ -539,42 +478,6 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
                             vertical: isTablet ? 20 : 16,
                           ),
                         ),
-                        maxLines: 8,
-                        validator: _useServiceAccount
-                            ? (value) {
-                                if (value == null || value.trim().isEmpty) {
-                                  return 'Service Account JSON is required';
-                                }
-                                try {
-                                  json.decode(value);
-                                } catch (e) {
-                                  return 'Invalid JSON format';
-                                }
-                                return null;
-                              }
-                            : null,
-                      ),
-                      SizedBox(height: isTablet ? 16 : 12),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: _buildPillButton(
-                              text: 'Paste',
-                              onPressed: _pasteFromClipboard,
-                              isPrimary: false,
-                              icon: Icons.paste,
-                            ),
-                          ),
-                          SizedBox(width: isTablet ? 16 : 12),
-                          Expanded(
-                            child: _buildPillButton(
-                              text: 'Clear',
-                              onPressed: _clearServiceAccount,
-                              isPrimary: false,
-                              icon: Icons.clear,
-                            ),
-                          ),
-                        ],
                       ),
                     ],
 
@@ -623,7 +526,7 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
 
                     // Setup Instructions
                     Text(
-                      'Setup Instructions',
+                      'How to get an API Key',
                       style: TextStyle(
                         fontSize: isTablet ? 20 : 18,
                         fontWeight: FontWeight.w700,
@@ -632,11 +535,9 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
                     ),
                     SizedBox(height: isTablet ? 16 : 12),
                     Text(
-                      '1. Create a Google Cloud Project\n'
-                      '2. Enable the Vertex AI API\n'
-                      '3. Create a Service Account (optional)\n'
-                      '4. Download the JSON key file\n'
-                      '5. Paste the JSON content above',
+                      '1. Go to Google AI Studio\n'
+                      '2. Create a new API Key\n'
+                      '3. Copy the key and paste it here',
                       style: TextStyle(
                         fontSize: isTablet ? 16 : 14,
                         color: Colors.grey[700],

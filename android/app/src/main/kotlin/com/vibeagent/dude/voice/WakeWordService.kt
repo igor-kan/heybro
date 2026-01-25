@@ -112,7 +112,7 @@ class WakeWordService : Service() {
         try {
             // Create the wake word callback
             val wakeWordCallback = PorcupineManagerCallback { keywordIndex ->
-                Log.d(TAG, "Wake word 'Hey Droid' detected! Keyword index: $keywordIndex")
+                Log.d(TAG, "Wake word 'Hey Bro' detected! Keyword index: $keywordIndex")
                 wakeWordListener?.onWakeWordDetected(keywordIndex)
                 // Start voice interaction service
                 startVoiceInteraction()
@@ -139,10 +139,10 @@ class WakeWordService : Service() {
 
             porcupineManager?.start()
             isListening = true
-            Log.d(TAG, "Porcupine wake word detection started successfully for 'Hey Droid'")
+            Log.d(TAG, "Porcupine wake word detection started successfully for 'Hey Bro'")
             
             // Update notification to show listening status
-            updateNotification("Listening for 'Hey Droid'...")
+            updateNotification("Listening for 'Hey Bro'...")
             
         } catch (e: Exception) {
             Log.e(TAG, "Error starting Porcupine: ${e.message}", e)
@@ -166,7 +166,7 @@ class WakeWordService : Service() {
                     porcupineManager?.start()
                     isListening = true
                     Log.d(TAG, "Started listening for wake word")
-                    updateNotification("Listening for 'Hey Droid'...")
+                    updateNotification("Listening for 'Hey Bro'...")
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to start listening: ${e.message}", e)
                     wakeWordListener?.onError("Failed to start listening: ${e.message}")
@@ -221,7 +221,7 @@ class WakeWordService : Service() {
     }
 
     fun getAvailableKeywords(): Array<String> {
-        return arrayOf("hey droid")
+        return arrayOf("Hey Bro")
     }
 
     fun updateSensitivity(sensitivity: Float) {

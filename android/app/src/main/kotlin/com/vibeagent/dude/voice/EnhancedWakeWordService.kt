@@ -231,7 +231,7 @@ class EnhancedWakeWordService : Service() {
         try {
             // Create the wake word callback
             val wakeWordCallback = PorcupineManagerCallback { keywordIndex ->
-                Log.d(TAG, "Wake word 'Hey Droid' detected! Keyword index: $keywordIndex")
+                Log.d(TAG, "Wake word 'Hey Bro' detected! Keyword index: $keywordIndex")
                 wakeWordListener?.onWakeWordDetected(keywordIndex)
                 // Start voice interaction service
                 startVoiceInteraction()
@@ -282,10 +282,10 @@ class EnhancedWakeWordService : Service() {
 
             porcupineManager?.start()
             isListening = true
-            Log.d(TAG, "Porcupine wake word detection started successfully for 'Hey Droid'")
+            Log.d(TAG, "Porcupine wake word detection started successfully for 'Hey Bro'")
             
             // Update notification to show listening status with engine info
-            updateNotification("Listening for 'Hey Droid' with Porcupine engine")
+            updateNotification("Listening for 'Hey Bro' with Porcupine engine")
             
         } catch (e: Exception) {
             Log.e(TAG, "Error starting Porcupine: ${e.message}", e)
@@ -316,7 +316,7 @@ class EnhancedWakeWordService : Service() {
                     porcupineManager?.start()
                     isListening = true
                     Log.d(TAG, "Started listening for wake word")
-                    updateNotification("Listening for 'Hey Droid'...")
+                    updateNotification("Listening for 'Hey Bro'...")
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to start listening: ${e.message}", e)
                     wakeWordListener?.onError("Failed to start listening: ${e.message}")
@@ -414,7 +414,7 @@ class EnhancedWakeWordService : Service() {
                     isListening = true
                     
                     Log.d(TAG, "Wake word service reset complete")
-                    updateNotification("Listening for 'Hey Droid' with Porcupine engine")
+                    updateNotification("Listening for 'Hey Bro' with Porcupine engine")
                 } catch (e: Exception) {
                     Log.e(TAG, "Error during wake word service reset: ${e.message}", e)
                     // Try to reinitialize completely if reset fails
@@ -447,7 +447,7 @@ class EnhancedWakeWordService : Service() {
     }
 
     fun getAvailableKeywords(): Array<String> {
-        return arrayOf("hey droid")
+        return arrayOf("Hey Bro")
     }
 
     fun updateSensitivity(sensitivity: Float) {
@@ -701,7 +701,7 @@ class EnhancedWakeWordService : Service() {
                 currentEngine = WakeWordEngine.STT_FALLBACK
                 
                 Log.d(TAG, "Switching to STT fallback engine")
-                updateNotification("Listening for 'Hey Droid' with STT fallback engine")
+                updateNotification("Listening for 'Hey Bro' with STT fallback engine")
                 
                 // Start STT-based wake word detection
                 startSTTWakeWordDetection()
@@ -716,7 +716,7 @@ class EnhancedWakeWordService : Service() {
     private fun startSTTWakeWordDetection() {
         serviceScope.launch {
             try {
-                Log.d(TAG, "Starting STT wake word detection for 'Hey Droid'")
+                Log.d(TAG, "Starting STT wake word detection for 'Hey Bro'")
                 
                 // Initialize STT service if not already done
                 if (!sttServiceBound) {
@@ -762,7 +762,7 @@ class EnhancedWakeWordService : Service() {
                 }
                 
                 isListening = true
-                updateNotification("Listening for 'Hey Droid' with STT engine")
+                updateNotification("Listening for 'Hey Bro' with STT engine")
                 Log.d(TAG, "STT wake word detection started successfully")
                 
             } catch (e: Exception) {
@@ -927,7 +927,7 @@ class EnhancedWakeWordService : Service() {
                 }
                 
                 isListening = true
-                updateNotification("Listening for 'Hey Droid' with STT engine")
+                updateNotification("Listening for 'Hey Bro' with STT engine")
                 Log.d(TAG, "STT listening restarted successfully after detection")
                 
             } catch (e: Exception) {

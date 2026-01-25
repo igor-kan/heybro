@@ -25,21 +25,55 @@ class TextInputActivity {
                 }
 
                 val service = MyAccessibilityService.instance ?: return@withContext false
-                 val rootNode = service.rootInActiveWindow ?: return@withContext false
-                 
-                 // Find the currently focused input field directly
-                 val focusedInput = findFocusedEditableNode(rootNode)
+                
+                // Retry loop for finding focused input
+                var focusedInput: AccessibilityNodeInfo? = null
+                for (attempt in 1..INPUT_RETRY_ATTEMPTS) {
+                    val rootNode = service.rootInActiveWindow
+                    if (rootNode != null) {
+                         // 1. Try strict focused search
+                         focusedInput = findFocusedEditableNode(rootNode)
+                         
+                         // 2. Fallback: If no focused node, try to find ANY editable node
+                         if (focusedInput == null) {
+                             Log.w(TAG, "⚠️ No focused input found (attempt $attempt), trying fallback...")
+                             focusedInput = findFirstEditableNode(rootNode)
+                         }
+                         
+                         rootNode.recycle()
+                    }
+                    
+                    if (focusedInput != null) {
+                        break
+                    }
+                    
+                    if (attempt < INPUT_RETRY_ATTEMPTS) {
+                        Log.d(TAG, "⏳ Waiting for focus... ($attempt/$INPUT_RETRY_ATTEMPTS)")
+                        delay(FOCUS_WAIT_DELAY)
+                    }
+                }
                 
                 if (focusedInput == null) {
-                    Log.e(TAG, "❌ No focused input found")
+                    Log.e(TAG, "❌ No input field found after $INPUT_RETRY_ATTEMPTS attempts")
                     return@withContext false
                 }
+                
+                Log.d(TAG, "✅ Found target input: ${focusedInput.className}")
                 
                 // Clear cache and set text directly
                  service.clearFocusCache()
                  val arguments = Bundle()
                  arguments.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
                  val success = focusedInput.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)
+                 
+                 // If that failed, try paste
+                 if (!success) {
+                     Log.w(TAG, "⚠️ SET_TEXT failed, trying PASTE")
+                     val pasteSuccess = focusedInput.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+                     if (pasteSuccess) Log.d(TAG, "✅ PASTE successful")
+                 }
+                 
+                focusedInput.recycle()
                 
                 if (success) {
                     Log.d(TAG, "✅ Text set: '$text'")
@@ -58,7 +92,7 @@ class TextInputActivity {
     private fun findFocusedEditableNode(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         try {
             if (node.isFocused && node.isEditable) {
-                return node
+                return AccessibilityNodeInfo.obtain(node)
             }
             
             for (i in 0 until node.childCount) {
@@ -71,6 +105,28 @@ class TextInputActivity {
                 child.recycle()
             }
             
+            return null
+        } catch (e: Exception) {
+            return null
+        }
+    }
+
+    private fun findFirstEditableNode(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        try {
+            // Just find the first thing that looks like a text box
+            if (node.isEditable || node.className?.toString()?.contains("EditText") == true) {
+                return AccessibilityNodeInfo.obtain(node)
+            }
+            
+            for (i in 0 until node.childCount) {
+                val child = node.getChild(i) ?: continue
+                val result = findFirstEditableNode(child)
+                if (result != null) {
+                    child.recycle()
+                    return result
+                }
+                child.recycle()
+            }
             return null
         } catch (e: Exception) {
             return null

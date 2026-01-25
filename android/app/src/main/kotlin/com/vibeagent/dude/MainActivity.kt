@@ -220,7 +220,7 @@ class MainActivity : FlutterActivity() {
             // Initialize voice agent coordinator
             voiceAgentCoordinator = VoiceAgentCoordinator.getInstance(this)
             
-            // Start wake word service for "Hey Droid" detection
+            // Start wake word service for "Hey Bro" detection
             startWakeWordService()
             
             // Register voice command receiver
@@ -234,7 +234,7 @@ class MainActivity : FlutterActivity() {
     
     private fun startWakeWordService() {
         try {
-            Log.d(TAG, "Starting Enhanced Wake Word Service for 'Hey Droid' detection")
+            Log.d(TAG, "Starting Enhanced Wake Word Service for 'Hey Bro' detection")
             
             // Enable auto-start when user manually starts the service
             EnhancedWakeWordService.setAutoStartEnabled(this, true)
@@ -731,7 +731,9 @@ class MainActivity : FlutterActivity() {
         try {
             when (call.method) {
                 // Screen capture and analysis
-                "takeScreenshot" -> handleTakeScreenshot(result)
+                // Screen capture and analysis
+                "takeScreenshot" -> handleTakeScreenshot(call, result)
+                "resizeImage" -> handleResizeImage(call, result)
                 "getAccessibilityTree" -> handleGetAccessibilityTree(result)
                 "getScreenElements" -> handleGetAccessibilityTree(result)
                 "analyzeScreen" -> handleAnalyzeScreen(result)
@@ -740,6 +742,7 @@ class MainActivity : FlutterActivity() {
 
                 // Touch operations
                 "performTap" -> handlePerformTap(call, result)
+                "performGroupedTaps" -> handlePerformGroupedTaps(call, result)
                 "performLongPress" -> handlePerformLongPress(call, result)
                 "performDoubleClick" -> handlePerformDoubleClick(call, result)
 
@@ -806,15 +809,42 @@ class MainActivity : FlutterActivity() {
 
     // ==================== SCREEN CAPTURE & ANALYSIS ====================
 
-    private fun handleTakeScreenshot(result: MethodChannel.Result) {
+    private fun handleTakeScreenshot(call: MethodCall, result: MethodChannel.Result) {
+        val lowQuality = call.argument<Boolean>("low_quality") ?: false
         coroutineScope.launch {
             try {
-                val screenshot = toolActivityManager.takeScreenshot()
+                val screenshot = toolActivityManager.takeScreenshot(lowQuality)
                 result.success(screenshot)
-                Log.d(TAG, "✅ Screenshot captured")
+                Log.d(TAG, "✅ Screenshot captured (lowQuality=$lowQuality)")
             } catch (e: Exception) {
                 Log.e(TAG, "❌ Screenshot error: ${e.message}", e)
                 result.error("SCREENSHOT_ERROR", e.message, null)
+            }
+        }
+    }
+
+    private fun handleResizeImage(call: MethodCall, result: MethodChannel.Result) {
+        coroutineScope.launch {
+            try {
+                val base64Image = call.argument<String>("base64Image") ?: ""
+                val targetWidth = call.argument<Int>("targetWidth") ?: 480
+                val quality = call.argument<Int>("quality") ?: 50
+
+                if (base64Image.isEmpty()) {
+                    result.error("INVALID_ARGUMENT", "base64Image cannot be empty", null)
+                    return@launch
+                }
+
+                val resized = toolActivityManager.resizeImage(base64Image, targetWidth, quality)
+                if (resized != null) {
+                    result.success(resized)
+                    Log.d(TAG, "✅ Image resized successfully")
+                } else {
+                    result.error("RESIZE_ERROR", "Failed to resize image", null)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Image resize error: ${e.message}", e)
+                result.error("RESIZE_ERROR", e.message, null)
             }
         }
     }
@@ -1047,6 +1077,34 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+
+    private fun handlePerformGroupedTaps(call: MethodCall, result: MethodChannel.Result) {
+        coroutineScope.launch {
+            try {
+                val tapsList = call.argument<List<Map<String, Any>>>("taps")
+                if (tapsList == null) {
+                    result.error("INVALID_ARGS", "Missing taps argument", null)
+                    return@launch
+                }
+                
+                // Convert flexible map to strictly typed map for Kotlin
+                val taps: List<Map<String, Float>> = tapsList.map { tap ->
+                    mapOf<String, Float>(
+                        "x" to ((tap["x"] as? Number)?.toFloat() ?: 0f),
+                        "y" to ((tap["y"] as? Number)?.toFloat() ?: 0f)
+                    )
+                }
+
+                val success = toolActivityManager.performGroupedTaps(taps)
+                result.success(success)
+                Log.d(TAG, if (success) "✅ Grouped taps successful" else "❌ Grouped taps failed")
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Grouped taps error: ${e.message}", e)
+                result.error("GROUPED_TAPS_ERROR", e.message, null)
+            }
+        }
+    }
+    
     private fun handlePerformScroll(call: MethodCall, result: MethodChannel.Result) {
         coroutineScope.launch {
             try {

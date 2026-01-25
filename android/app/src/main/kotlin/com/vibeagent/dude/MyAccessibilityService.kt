@@ -375,28 +375,36 @@ class MyAccessibilityService : AccessibilityService() {
             
             val rootNode = rootInActiveWindow
             if (rootNode != null) {
-                // Count input fields on screen to determine tapping strategy
-                val inputFields = getAllInputFields()
-                val hasMultipleInputFields = inputFields.size >= 2
-                
-                Log.d(TAG, "📊 Input fields detected: ${inputFields.size} (multiple: $hasMultipleInputFields)")
-                
+                // Precision Upgrade: Always try to find a target node first
                 val targetNode = findNodeAtCoordinates(rootNode, x, y)
                 if (targetNode != null) {
-                    // Use node-based tapping ONLY when we have multiple input fields AND we're tapping on an input field
-                    if (hasMultipleInputFields && isEditableNode(targetNode)) {
-                        Log.d(TAG, "📝 Multiple input fields + input field target detected - using node-based click")
+                    // If the node itself is clickable, click it directly
+                    if (targetNode.isClickable) {
+                        Log.d(TAG, "🎯 Found clickable node at ($x, $y) - performing direct click")
                         val success = performNodeBasedClick(targetNode)
                         targetNode.recycle()
-                        Log.d(TAG, if (success) "✅ Node-based click on input field successful" else "❌ Node-based click on input field failed")
+                        rootNode.recycle()
                         return success
                     }
+                    
+                    // If node is not clickable, check if it has a clickable parent
+                    val clickableParent = findClickableParent(targetNode)
+                    if (clickableParent != null) {
+                         Log.d(TAG, "🎯 Found clickable parent for node at ($x, $y) - performing direct click")
+                         val success = performNodeBasedClick(clickableParent)
+                         clickableParent.recycle()
+                         targetNode.recycle()
+                         rootNode.recycle()
+                         return success
+                    }
+
                     targetNode.recycle()
                 }
+                rootNode.recycle()
             }
             
-            // For all other scenarios (single input field, non-input elements, or no multiple inputs), use normal coordinate-based tapping
-            Log.d(TAG, "🖱️ Using coordinate-based tap (normal scenario)")
+            // Fallback to coordinate-based tap if no clickable node found
+            Log.d(TAG, "🖱️ No clickable node found - using coordinate-based tap")
             val path = Path()
             path.moveTo(x, y)
 
@@ -426,6 +434,35 @@ class MyAccessibilityService : AccessibilityService() {
             val centerX = screenWidth / 2
             val centerY = screenHeight / 2
 
+            // Smart Scroll: Try to find a scrollable node first
+            val rootNode = rootInActiveWindow
+            if (rootNode != null) {
+                 // Try to find a scrollable node at the center (where we would gesture)
+                 val centerNode = findNodeAtCoordinates(rootNode, centerX, centerY)
+                 val scrollableNode = if (centerNode?.isScrollable == true) centerNode else findScrollableParent(centerNode)
+                 
+                 if (scrollableNode != null) {
+                     val action = when (direction.lowercase()) {
+                         "down", "right" -> AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+                         "up", "left" -> AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+                         else -> 0
+                     }
+                     
+                     if (action != 0) {
+                         Log.d(TAG, "📜 Found scrollable node - performing node-based scroll")
+                         val success = scrollableNode.performAction(action)
+                         scrollableNode.recycle() // Recycle if we found a parent or the node itself
+                         if (centerNode != scrollableNode) centerNode?.recycle()
+                         rootNode.recycle()
+                         return success
+                     }
+                 }
+                 centerNode?.recycle()
+                 rootNode.recycle()
+            }
+
+            // Fallback to gesture
+            Log.d(TAG, "📜 No scrollable node found - performing gesture-based scroll")
             val path = Path()
             when (direction.lowercase()) {
                 "up" -> {
@@ -458,14 +495,33 @@ class MyAccessibilityService : AccessibilityService() {
             val gesture = gestureBuilder.build()
             dispatchGesture(gesture, null, null)
         } catch (e: Exception) {
+            Log.e(TAG, "❌ Scroll error: ${e.message}", e)
             false
         }
     }
 
-    fun takeScreenshot(): String? {
+    private fun findScrollableParent(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+        if (node == null) return null
+        try {
+            var parent = node.parent
+            while (parent != null) {
+                if (parent.isScrollable) {
+                    return parent
+                }
+                val nextParent = parent.parent
+                parent.recycle()
+                parent = nextParent
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error finding scrollable parent: ${e.message}")
+        }
+        return null
+    }
+
+    fun takeScreenshot(lowQuality: Boolean = false): String? {
         return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                return takeScreenshotModern()
+                return takeScreenshotModern(lowQuality)
             } else {
                 return null
             }
@@ -475,7 +531,7 @@ class MyAccessibilityService : AccessibilityService() {
     }
 
     @TargetApi(Build.VERSION_CODES.R)
-    private fun takeScreenshotModern(): String? {
+    private fun takeScreenshotModern(lowQuality: Boolean): String? {
         return try {
             var resultBase64: String? = null
             val latch = CountDownLatch(1)
@@ -490,7 +546,7 @@ class MyAccessibilityService : AccessibilityService() {
                                                 result.colorSpace
                                         )
                                 if (bitmap != null) {
-                                    resultBase64 = bitmapToBase64(bitmap)
+                                    resultBase64 = bitmapToBase64(bitmap, lowQuality)
                                     bitmap.recycle()
                                 }
                                 result.hardwareBuffer.close()
@@ -519,67 +575,97 @@ class MyAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun bitmapToBase64(bitmap: Bitmap): String {
+    private fun bitmapToBase64(bitmap: Bitmap, lowQuality: Boolean): String {
         val outputStream = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
-        return Base64.encodeToString(outputStream.toByteArray(), Base64.DEFAULT)
+        if (lowQuality) {
+            // Resize to ~480p width maintenance aspect ratio
+            val width = bitmap.width
+            val height = bitmap.height
+            val targetWidth = 480
+            
+            var finalBitmap = bitmap
+            if (width > targetWidth) {
+                val scale = targetWidth.toFloat() / width
+                val targetHeight = (height * scale).toInt()
+                finalBitmap = Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight, true)
+            }
+            
+            // Use JPEG at 50% quality for average quality
+            finalBitmap.compress(Bitmap.CompressFormat.JPEG, 50, outputStream)
+            
+            if (finalBitmap != bitmap) {
+                finalBitmap.recycle()
+            }
+        } else {
+            // High quality PNG for normal operation
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
+        }
+        return Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
     }
 
     fun getScreenElements(): List<Map<String, Any?>> {
-        return try {
-            val rootNode = rootInActiveWindow
-            if (rootNode == null) {
-                Log.w(TAG, "⚠️ No active window found for accessibility tree")
-                return emptyList()
+        val allElements = mutableListOf<Map<String, Any?>>()
+        try {
+            // Modern apps often use multiple windows (e.g. bottom sheets, dialogs, split screen)
+            // accessing 'windows' gives us a more complete picture than 'rootInActiveWindow'
+            val windowsList = windows
+            Log.d(TAG, "🔍 Found ${windowsList.size} windows")
+            
+            if (windowsList.isNotEmpty()) {
+                // windows is ordered from back to front (z-order) usually, or we can sort by layer
+                // We want to process them all.
+                for (window in windowsList) {
+                    val root = window.root
+                    if (root != null) {
+                         // Force refresh if 0 children - sometimes helps with stale nodes
+                         if (root.childCount == 0) {
+                             root.refresh()
+                         }
+
+                         collectNodeInfo(root, allElements, window.type, window.layer)
+                         root.recycle()
+                    }
+                }
+            } else {
+                // Fallback to rootInActiveWindow if windows list is empty (rare)
+                val rootNode = rootInActiveWindow
+                if (rootNode != null) {
+                    collectNodeInfo(rootNode, allElements, -1, -1)
+                    rootNode.recycle()
+                }
             }
 
-            val packageName = rootNode.packageName?.toString()
-            val framework = detectAppFramework(packageName)
-            Log.d(TAG, "🔍 Extracting elements for $packageName using $framework framework")
-
-            val elements =
-                    when (framework) {
-                        AppFramework.FLUTTER -> extractFlutterElements(rootNode)
-                        AppFramework.REACT_NATIVE -> extractReactNativeElements(rootNode)
-                        AppFramework.XAMARIN -> extractXamarinElements(rootNode)
-                        else -> extractNativeElements(rootNode)
-                    }
-
-            Log.d(TAG, "✅ Extracted ${elements.size} screen elements")
-            rootNode.recycle()
-            elements
+            Log.d(TAG, "✅ Extracted ${allElements.size} screen elements from all windows")
+            return allElements
         } catch (e: Exception) {
             Log.e(TAG, "❌ Error extracting screen elements: ${e.message}", e)
-            emptyList()
+            return emptyList()
         }
     }
 
-    private fun extractNativeElements(rootNode: AccessibilityNodeInfo): List<Map<String, Any?>> {
-        return try {
-            val elements = mutableListOf<Map<String, Any?>>()
-            collectNativeNodeInfo(rootNode, elements)
-            Log.d(TAG, "✅ Extracted ${elements.size} native elements")
-            elements
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Error extracting native elements: ${e.message}", e)
-            emptyList()
-        }
-    }
-
-    private fun collectNativeNodeInfo(
+    private fun collectNodeInfo(
             node: AccessibilityNodeInfo,
-            elements: MutableList<Map<String, Any?>>
+            elements: MutableList<Map<String, Any?>>,
+            windowType: Int,
+            windowLayer: Int
     ) {
         try {
             val bounds = Rect()
             node.getBoundsInScreen(bounds)
 
+            // Relaxed visibility check: Even if bounds are empty, strict parents might have useful children?
+            // Usually empty bounds = invisible, but let's be safe. 
+            // Actually, keep !bounds.isEmpty logic but maybe allow 0-sized if they have children?
+            // For now, visible usually implies bounds.
             if (!bounds.isEmpty) {
                 val element = mutableMapOf<String, Any?>()
-                element["framework"] = "native"
                 element["type"] = node.className?.toString() ?: "unknown"
                 element["text"] = node.text?.toString() ?: ""
                 element["contentDescription"] = node.contentDescription?.toString() ?: ""
+                element["packageName"] = node.packageName?.toString()
+                element["resourceId"] = node.viewIdResourceName
+                
+                // State
                 element["clickable"] = node.isClickable
                 element["scrollable"] = node.isScrollable
                 element["editable"] = node.isEditable
@@ -588,6 +674,13 @@ class MyAccessibilityService : AccessibilityService() {
                 element["checkable"] = node.isCheckable
                 element["checked"] = node.isChecked
                 element["selected"] = node.isSelected
+                element["password"] = node.isPassword
+                element["visible"] = node.isVisibleToUser
+                
+                // Window metadata
+                if (windowType != -1) element["windowType"] = windowType
+                if (windowLayer != -1) element["windowLayer"] = windowLayer
+
                 element["bounds"] =
                         mapOf(
                                 "x" to bounds.centerX(),
@@ -599,146 +692,47 @@ class MyAccessibilityService : AccessibilityService() {
                                 "right" to bounds.right,
                                 "bottom" to bounds.bottom
                         )
-
-                val resourceId = node.viewIdResourceName
-                if (resourceId != null) {
-                    element["resourceId"] = resourceId
-                }
-
-                if (node.isClickable ||
-                                node.isScrollable ||
-                                !node.text.isNullOrEmpty() ||
-                                !node.contentDescription.isNullOrEmpty() ||
-                                node.isEditable
-                ) {
-                    elements.add(element)
-                }
-            }
-
-            for (i in 0 until node.childCount) {
-                try {
-                    val child = node.getChild(i)
-                    child?.let {
-                        collectNativeNodeInfo(it, elements)
-                        it.recycle()
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Error processing native child node: ${e.message}")
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Error collecting native node info: ${e.message}")
-        }
-    }
-
-    private fun extractFlutterElements(rootNode: AccessibilityNodeInfo): List<Map<String, Any?>> {
-        val elements = mutableListOf<Map<String, Any?>>()
-        collectFlutterNodeInfo(rootNode, elements)
-        return elements
-    }
-
-    private fun collectFlutterNodeInfo(
-            node: AccessibilityNodeInfo,
-            elements: MutableList<Map<String, Any?>>
-    ) {
-        try {
-            val bounds = Rect()
-            node.getBoundsInScreen(bounds)
-
-            if (!bounds.isEmpty) {
-                val element = mutableMapOf<String, Any?>()
-                element["framework"] = "flutter"
-                element["type"] = node.className?.toString() ?: "unknown"
-
-                val text = node.text?.toString() ?: ""
-                val contentDesc = node.contentDescription?.toString() ?: ""
-
-                element["text"] = text
-                element["contentDescription"] = contentDesc
-                element["clickable"] = node.isClickable
-                element["scrollable"] = node.isScrollable
-                element["editable"] = node.isEditable
-                element["enabled"] = node.isEnabled
-                element["focusable"] = node.isFocusable
-                element["bounds"] =
-                        mapOf(
-                                "x" to bounds.centerX(),
-                                "y" to bounds.centerY(),
-                                "width" to bounds.width(),
-                                "height" to bounds.height(),
-                                "left" to bounds.left,
-                                "top" to bounds.top,
-                                "right" to bounds.right,
-                                "bottom" to bounds.bottom
-                        )
-
+                
+                // Extract Actions
                 val actions = mutableListOf<String>()
-                if (node.actionList != null) {
-                    for (action in node.actionList) {
-                        actions.add(action.toString())
-                    }
-                }
+                node.actionList?.forEach { actions.add(it.toString()) }
                 element["actions"] = actions
-
-                if (isFlutterWidget(node)) {
-                    element["flutterWidget"] = true
-                    extractFlutterSpecificInfo(node, element)
+                
+                // Extract Flutter/Extras if present (Universal)
+                val extras = node.extras
+                if (extras != null && !extras.isEmpty) {
+                    val extrasMap = mutableMapOf<String, Any?>()
+                    for (key in extras.keySet()) {
+                         // Filter out huge objects if necessary, but string/primitives are fine
+                         try {
+                            extras.get(key)?.let { extrasMap[key] = it.toString() }
+                         } catch(_: Exception) {}
+                    }
+                    if (extrasMap.isNotEmpty()) element["extras"] = extrasMap
                 }
 
-                if (node.isClickable ||
-                                node.isScrollable ||
-                                text.isNotEmpty() ||
-                                contentDesc.isNotEmpty() ||
-                                node.isEditable ||
-                                isFlutterWidget(node)
-                ) {
+                // IMPROVED FILTERING:
+                // Include if it has any meaningful interaction OR content OR ID
+                // Relaxed: if it has a Resource ID, we keep it (good for anchors)
+                val hasContent = !element["text"].toString().isNullOrEmpty() || 
+                                 !element["contentDescription"].toString().isNullOrEmpty()
+                val isInteractive = node.isClickable || node.isScrollable || node.isEditable || node.isCheckable
+                val hasId = !node.viewIdResourceName.isNullOrEmpty()
+                
+                if (hasContent || isInteractive || hasId) {
                     elements.add(element)
                 }
             }
 
+            // Recurse
             for (i in 0 until node.childCount) {
-                try {
-                    val child = node.getChild(i)
-                    child?.let {
-                        collectFlutterNodeInfo(it, elements)
-                        it.recycle()
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Error processing Flutter child node: ${e.message}")
+                node.getChild(i)?.let { child ->
+                    collectNodeInfo(child, elements, windowType, windowLayer)
+                    child.recycle()
                 }
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Error collecting Flutter node info: ${e.message}")
-        }
-    }
-
-    private fun isFlutterWidget(node: AccessibilityNodeInfo): Boolean {
-        val className = node.className?.toString() ?: ""
-        return className.contains("flutter", ignoreCase = true) ||
-                className.contains("semantics", ignoreCase = true) ||
-                node.contentDescription?.toString()?.contains("flutter", ignoreCase = true) == true
-    }
-
-    private fun extractFlutterSpecificInfo(
-            node: AccessibilityNodeInfo,
-            element: MutableMap<String, Any?>
-    ) {
-        try {
-            val flutterInfo = mutableMapOf<String, Any?>()
-            val extras = node.extras
-            for (key in extras.keySet()) {
-                try {
-                    flutterInfo[key] = extras.get(key)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Error extracting Flutter extra: $key")
-                }
-            }
-
-            if (flutterInfo.isNotEmpty()) {
-                element["flutterExtras"] = flutterInfo
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Error extracting Flutter specific info: ${e.message}")
+            Log.w(TAG, "Error collecting node info: ${e.message}")
         }
     }
 
@@ -1012,17 +1006,16 @@ class MyAccessibilityService : AccessibilityService() {
                 textList.add(contentDesc)
             }
 
-            if (isFlutterWidget(node)) {
-                val extras = node.extras
+            // simplified: just use standard extras if present, no framework specific check
+            val extras = node.extras
+            if (extras != null) {
                 for (key in extras.keySet()) {
                     try {
                         val value = extras.get(key)?.toString()
                         if (!value.isNullOrEmpty() && value != "null") {
-                            textList.add(value)
+                             textList.add(value)
                         }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Error extracting Flutter text from extras: ${e.message}")
-                    }
+                    } catch (_: Exception) {}
                 }
             }
 
@@ -1034,13 +1027,15 @@ class MyAccessibilityService : AccessibilityService() {
                         it.recycle()
                     }
                 } catch (e: Exception) {
-                    Log.w(TAG, "Error processing Flutter child for text: ${e.message}")
+                    Log.w(TAG, "Error processing child for text: ${e.message}")
                 }
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Error collecting Flutter text: ${e.message}")
+            Log.w(TAG, "Error collecting flutter text: ${e.message}")
         }
     }
+
+// Duplicate code tail removed
 
     private fun collectAllReactNativeText(
             node: AccessibilityNodeInfo,
@@ -1707,6 +1702,36 @@ class MyAccessibilityService : AccessibilityService() {
                 return false
             }
 
+            Log.d(TAG, "🖱️ Attempting long press at ($x, $y)")
+
+            val rootNode = rootInActiveWindow
+            if (rootNode != null) {
+                // Precision Upgrade: Try to find a long-clickable node first
+                val targetNode = findNodeAtCoordinates(rootNode, x, y)
+                if (targetNode != null) {
+                    if (targetNode.isLongClickable) {
+                         Log.d(TAG, "🎯 Found long-clickable node at ($x, $y) - performing direct long click")
+                         val success = targetNode.performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK)
+                         targetNode.recycle()
+                         rootNode.recycle()
+                         return success
+                    }
+                    
+                    // Check parent
+                    val longClickableParent = findLongClickableParent(targetNode)
+                    if (longClickableParent != null) {
+                        Log.d(TAG, "🎯 Found long-clickable parent for node at ($x, $y) - performing direct long click")
+                        val success = longClickableParent.performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK)
+                        longClickableParent.recycle()
+                        targetNode.recycle()
+                        rootNode.recycle()
+                        return success
+                    }
+                    targetNode.recycle()
+                }
+                rootNode.recycle()
+            }
+
             val path = Path()
             path.moveTo(x, y)
 
@@ -1717,7 +1742,25 @@ class MyAccessibilityService : AccessibilityService() {
             val gesture = gestureBuilder.build()
             dispatchGesture(gesture, null, null)
         } catch (e: Exception) {
+            Log.e(TAG, "❌ Long press error: ${e.message}", e)
             false
+        }
+    }
+
+    private fun findLongClickableParent(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        return try {
+            var parent = node.parent
+            while (parent != null) {
+                if (parent.isLongClickable) {
+                    return parent
+                }
+                val nextParent = parent.parent
+                parent.recycle()
+                parent = nextParent
+            }
+            null
+        } catch (e: Exception) {
+            null
         }
     }
 
@@ -2166,6 +2209,7 @@ class MyAccessibilityService : AccessibilityService() {
         }
     }
 
+    // Unified detailed info extraction
     fun getDetailedScreenInfo(): Map<String, Any?> {
         return try {
             val info = mutableMapOf<String, Any?>()
@@ -2174,247 +2218,30 @@ class MyAccessibilityService : AccessibilityService() {
             if (rootNode != null) {
                 val bounds = Rect()
                 rootNode.getBoundsInScreen(bounds)
-                val packageName = rootNode.packageName?.toString()
-                val framework = detectAppFramework(packageName)
-
-                info["screen_bounds"] =
-                        mapOf("width" to bounds.width(), "height" to bounds.height())
-                info["current_package"] = packageName ?: "unknown"
-                info["framework"] = framework.toString()
-
-                val elements =
-                        when (framework) {
-                            AppFramework.FLUTTER -> extractFlutterElements(rootNode)
-                            AppFramework.REACT_NATIVE -> extractReactNativeElements(rootNode)
-                            AppFramework.XAMARIN -> extractXamarinElements(rootNode)
-                            else -> extractNativeElements(rootNode)
-                        }
-
+                val packageName = rootNode.packageName?.toString() ?: "unknown"
+                
+                info["screen_bounds"] = mapOf("width" to bounds.width(), "height" to bounds.height())
+                info["current_package"] = packageName
+                
+                // Use the unified getScreenElements method
+                val elements = getScreenElements()
                 info["total_elements"] = elements.size
                 info["clickable_elements"] = elements.count { it["clickable"] == true }
                 info["text_elements"] = elements.count { !(it["text"] as? String).isNullOrEmpty() }
-                info["framework_specific_elements"] =
-                        elements.count {
-                            it.containsKey("flutterWidget") ||
-                                    it.containsKey("reactNativeComponent")
-                        }
-
+                
                 rootNode.recycle()
             } else {
                 info["error"] = "No root node available"
             }
-
             info
         } catch (e: Exception) {
             mapOf("error" to e.message)
         }
     }
 
-    fun extractFrameworkSpecificContent(): Map<String, Any?> {
-        return try {
-            val rootNode = rootInActiveWindow ?: return mapOf("error" to "No root node")
-            val packageName = rootNode.packageName?.toString()
-            val framework = detectAppFramework(packageName)
 
-            val content = mutableMapOf<String, Any?>()
-            content["framework"] = framework.toString()
-            content["package"] = packageName
+    // Dead code removed
 
-            when (framework) {
-                AppFramework.FLUTTER -> {
-                    content["flutter_widgets"] = extractFlutterWidgetInfo(rootNode)
-                    content["flutter_text"] = extractAllFlutterText(rootNode)
-                }
-                AppFramework.REACT_NATIVE -> {
-                    content["react_components"] = extractReactNativeComponentInfo(rootNode)
-                    content["react_text"] = extractAllReactNativeText(rootNode)
-                }
-                AppFramework.XAMARIN -> {
-                    content["xamarin_controls"] = extractXamarinControlInfo(rootNode)
-                    content["xamarin_text"] = extractAllXamarinText(rootNode)
-                }
-                else -> {
-                    content["native_views"] = extractNativeViewInfo(rootNode)
-                    content["native_text"] = extractAllNativeText(rootNode)
-                }
-            }
-
-            rootNode.recycle()
-            content
-        } catch (e: Exception) {
-            mapOf("error" to e.message)
-        }
-    }
-
-    private fun extractFlutterWidgetInfo(rootNode: AccessibilityNodeInfo): List<Map<String, Any?>> {
-        val widgets = mutableListOf<Map<String, Any?>>()
-        collectFlutterWidgets(rootNode, widgets)
-        return widgets
-    }
-
-    private fun collectFlutterWidgets(
-            node: AccessibilityNodeInfo,
-            widgets: MutableList<Map<String, Any?>>
-    ) {
-        try {
-            if (isFlutterWidget(node)) {
-                val widget = mutableMapOf<String, Any?>()
-                widget["type"] = node.className?.toString()
-                widget["text"] = node.text?.toString()
-                widget["contentDescription"] = node.contentDescription?.toString()
-
-                val bounds = Rect()
-                node.getBoundsInScreen(bounds)
-                widget["bounds"] =
-                        mapOf(
-                                "x" to bounds.centerX(),
-                                "y" to bounds.centerY(),
-                                "width" to bounds.width(),
-                                "height" to bounds.height()
-                        )
-
-                extractFlutterSpecificInfo(node, widget)
-                widgets.add(widget)
-            }
-
-            for (i in 0 until node.childCount) {
-                node.getChild(i)?.let { child ->
-                    collectFlutterWidgets(child, widgets)
-                    child.recycle()
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Error collecting Flutter widgets: ${e.message}")
-        }
-    }
-
-    private fun extractReactNativeComponentInfo(
-            rootNode: AccessibilityNodeInfo
-    ): List<Map<String, Any?>> {
-        val components = mutableListOf<Map<String, Any?>>()
-        collectReactNativeComponents(rootNode, components)
-        return components
-    }
-
-    private fun collectReactNativeComponents(
-            node: AccessibilityNodeInfo,
-            components: MutableList<Map<String, Any?>>
-    ) {
-        try {
-            if (isReactNativeComponent(node)) {
-                val component = mutableMapOf<String, Any?>()
-                component["type"] = node.className?.toString()
-                component["text"] = node.text?.toString()
-                component["contentDescription"] = node.contentDescription?.toString()
-
-                val bounds = Rect()
-                node.getBoundsInScreen(bounds)
-                component["bounds"] =
-                        mapOf(
-                                "x" to bounds.centerX(),
-                                "y" to bounds.centerY(),
-                                "width" to bounds.width(),
-                                "height" to bounds.height()
-                        )
-
-                components.add(component)
-            }
-
-            for (i in 0 until node.childCount) {
-                node.getChild(i)?.let { child ->
-                    collectReactNativeComponents(child, components)
-                    child.recycle()
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Error collecting React Native components: ${e.message}")
-        }
-    }
-
-    private fun extractXamarinControlInfo(
-            rootNode: AccessibilityNodeInfo
-    ): List<Map<String, Any?>> {
-        val controls = mutableListOf<Map<String, Any?>>()
-        collectXamarinControls(rootNode, controls)
-        return controls
-    }
-
-    private fun collectXamarinControls(
-            node: AccessibilityNodeInfo,
-            controls: MutableList<Map<String, Any?>>
-    ) {
-        try {
-            val control = mutableMapOf<String, Any?>()
-            control["type"] = node.className?.toString()
-            control["text"] = node.text?.toString()
-            control["contentDescription"] = node.contentDescription?.toString()
-
-            val bounds = Rect()
-            node.getBoundsInScreen(bounds)
-            control["bounds"] =
-                    mapOf(
-                            "x" to bounds.centerX(),
-                            "y" to bounds.centerY(),
-                            "width" to bounds.width(),
-                            "height" to bounds.height()
-                    )
-
-            if (node.isClickable || node.isScrollable || !node.text.isNullOrEmpty()) {
-                controls.add(control)
-            }
-
-            for (i in 0 until node.childCount) {
-                node.getChild(i)?.let { child ->
-                    collectXamarinControls(child, controls)
-                    child.recycle()
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Error collecting Xamarin controls: ${e.message}")
-        }
-    }
-
-    private fun extractNativeViewInfo(rootNode: AccessibilityNodeInfo): List<Map<String, Any?>> {
-        val views = mutableListOf<Map<String, Any?>>()
-        collectNativeViews(rootNode, views)
-        return views
-    }
-
-    private fun collectNativeViews(
-            node: AccessibilityNodeInfo,
-            views: MutableList<Map<String, Any?>>
-    ) {
-        try {
-            val view = mutableMapOf<String, Any?>()
-            view["type"] = node.className?.toString()
-            view["text"] = node.text?.toString()
-            view["contentDescription"] = node.contentDescription?.toString()
-            view["resourceId"] = node.viewIdResourceName
-
-            val bounds = Rect()
-            node.getBoundsInScreen(bounds)
-            view["bounds"] =
-                    mapOf(
-                            "x" to bounds.centerX(),
-                            "y" to bounds.centerY(),
-                            "width" to bounds.width(),
-                            "height" to bounds.height()
-                    )
-
-            if (node.isClickable || node.isScrollable || !node.text.isNullOrEmpty()) {
-                views.add(view)
-            }
-
-            for (i in 0 until node.childCount) {
-                node.getChild(i)?.let { child ->
-                    collectNativeViews(child, views)
-                    child.recycle()
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Error collecting native views: ${e.message}")
-        }
-    }
 
     /**
      * Launch an app by package name using accessibility service privileges

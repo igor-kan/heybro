@@ -2,6 +2,9 @@ package com.vibeagent.dude
 
 import android.content.Context
 import android.util.Log
+import android.util.Base64
+import java.io.ByteArrayOutputStream
+import kotlinx.coroutines.*
 
 class ToolActivityManager(private val context: Context) {
     companion object {
@@ -60,6 +63,41 @@ class ToolActivityManager(private val context: Context) {
             result
         } catch (e: Exception) {
             Log.e(TAG, "❌ Exception in performTap: ${e.message}", e)
+            false
+        }
+    }
+
+    suspend fun performGroupedTaps(taps: List<Map<String, Float>>): Boolean {
+        return try {
+            Log.d(TAG, "🖱️ Performing grouped taps: ${taps.size} taps")
+            
+            if (!tapActivity.isServiceAvailable()) {
+                Log.e(TAG, "❌ TapActivity service not available for grouped taps")
+                return false
+            }
+
+            var successCount = 0
+            for (tap in taps) {
+                val x = tap["x"] ?: continue
+                val y = tap["y"] ?: continue
+                
+                // Use existing performTap logic (direct call to tapActivity to avoid excessive logging/checks if trusted, 
+                // but let's use performTap for safety/clamping if it's not too slow. 
+                // actually calling performTap ensures clamping validation.)
+                // Given we want speed, maybe direct? But clamping is safer. 
+                // Let's call performTap but maybe we suppress logs? No, logs are fine.
+                
+                if (performTap(x, y)) {
+                    successCount++
+                }
+                // Small delay between taps to ensure registration
+                kotlinx.coroutines.delay(200)
+            }
+            
+            Log.d(TAG, "✅ Grouped taps complete: $successCount/${taps.size} successful")
+            successCount > 0
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Exception in performGroupedTaps: ${e.message}", e)
             false
         }
     }
@@ -288,7 +326,7 @@ class ToolActivityManager(private val context: Context) {
 
     // ==================== SCREEN CAPTURE OPERATIONS ====================
 
-    suspend fun takeScreenshot(): String? {
+    suspend fun takeScreenshot(lowQuality: Boolean = false): String? {
         return try {
             Log.d(TAG, "📸 Delegating screenshot to ScreenCaptureActivity")
 
@@ -297,7 +335,7 @@ class ToolActivityManager(private val context: Context) {
                 return null
             }
 
-            val result = screenCaptureActivity.takeScreenshot()
+            val result = screenCaptureActivity.takeScreenshot(lowQuality)
             Log.d(
                     TAG,
                     if (result != null) "✅ Screenshot taken successfully (${result.length} chars)"
@@ -655,5 +693,44 @@ class ToolActivityManager(private val context: Context) {
     }
 
     // Input Chip Handler Methods
+
+    fun resizeImage(base64Image: String, targetWidth: Int = 480, quality: Int = 50): String? {
+        return try {
+            if (base64Image.isEmpty()) return null
+
+            // Decode
+            val decodedBytes = Base64.decode(base64Image, Base64.NO_WRAP)
+            var bitmap = android.graphics.BitmapFactory.decodeByteArray(decodedBytes, 0, decodedBytes.size)
+
+            if (bitmap == null) return null
+
+            // Resize
+            val width = bitmap.width
+            val height = bitmap.height
+            
+            if (width > targetWidth) {
+                val scale = targetWidth.toFloat() / width
+                val targetHeight = (height * scale).toInt()
+                val resized = android.graphics.Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight, true)
+                if (resized != bitmap) {
+                    bitmap.recycle()
+                    bitmap = resized
+                }
+            }
+
+            // Compress
+            val outputStream = java.io.ByteArrayOutputStream()
+            bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, quality, outputStream)
+            val result = Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
+
+            // Cleanup
+            bitmap.recycle()
+            
+            result
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error resizing image: ${e.message}", e)
+            null
+        }
+    }
 
 }

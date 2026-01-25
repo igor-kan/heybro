@@ -80,11 +80,11 @@ class SecureStorage {
 
   /// Save Vertex AI Service Account configuration securely
   Future<void> saveApiConfiguration({
-    String apiKey = 'service_account_auth', // Placeholder for compatibility
+    String apiKey = '',
     required String projectId,
-    String modelId = 'gemini-2.5-pro',
+    String modelId = 'gemini-2.0-flash-exp',
     String region = 'us-central1',
-    required String serviceAccountJson,
+    String? serviceAccountJson,
     String? refreshToken,
     Map<String, dynamic>? additionalConfig,
   }) async {
@@ -93,15 +93,30 @@ class SecureStorage {
       if (!_isValidProjectId(projectId)) {
         throw ArgumentError('Invalid Google Cloud project ID format');
       }
-      if (!availableModels.containsKey(modelId)) {
-        throw ArgumentError('Unsupported model ID: $modelId');
-      }
-      if (!_isValidServiceAccount(serviceAccountJson)) {
-        throw ArgumentError('Invalid Service Account JSON format');
+      
+      // Relaxed model validation to allow custom models
+      // if (!availableModels.containsKey(modelId)) {
+      //   throw ArgumentError('Unsupported model ID: $modelId');
+      // }
+      
+      // Only validate service account if provided and not empty
+      if (serviceAccountJson != null && serviceAccountJson.isNotEmpty) {
+        if (!_isValidServiceAccount(serviceAccountJson)) {
+            // For backward compatibility or if usage relies on it
+             // throw ArgumentError('Invalid Service Account JSON format');
+             // Actually, let's just ignore it if it's not valid JSON, or warn. 
+             // But to fix the user issue, we just won't pass it.
+             // If we do pass it, it must be valid.
+             // Reverting to strict check ONLY if provided.
+             if (!_isValidServiceAccount(serviceAccountJson)) {
+                  throw ArgumentError('Invalid Service Account JSON format ($serviceAccountJson)');
+             }
+        }
       }
 
-      // Save placeholder API key for compatibility
-      final encryptedApiKey = await _encryptData(apiKey);
+      // Save placeholder API key if missing
+      final apiKeyToSave = apiKey.isNotEmpty ? apiKey : '';
+      final encryptedApiKey = await _encryptData(apiKeyToSave);
       await _secureStorage.write(key: _apiKeyKey, value: encryptedApiKey);
 
       // Save project ID (less sensitive, but still encrypted)
@@ -111,7 +126,7 @@ class SecureStorage {
       // Save model configuration
       final modelConfig = {
         'model_id': modelId,
-        'model_name': availableModels[modelId]!['name'],
+        'model_name': availableModels[modelId]?['name'] ?? modelId, // Safe lookup with fallback
         'region': region,
         'saved_at': DateTime.now().toIso8601String(),
         'additional_config': additionalConfig ?? {},
@@ -120,10 +135,17 @@ class SecureStorage {
       await _secureStorage.write(
           key: _modelConfigKey, value: encryptedModelConfig);
 
-      // Save service account JSON (required)
-      final encryptedServiceAccount = await _encryptData(serviceAccountJson);
-      await _secureStorage.write(
-          key: _serviceAccountKey, value: encryptedServiceAccount);
+      // Save service account JSON (optional)
+      if (serviceAccountJson != null && serviceAccountJson.isNotEmpty) {
+        final encryptedServiceAccount = await _encryptData(serviceAccountJson);
+        await _secureStorage.write(
+            key: _serviceAccountKey, value: encryptedServiceAccount);
+      } else {
+        // If explicitly null/empty, maybe delete old one? 
+        // For now, let's just not overwrite with garbage. 
+        // Or if we want to support switching from service account TO api key, we should clear it.
+        await _secureStorage.delete(key: _serviceAccountKey);
+      }
 
       // Save refresh token if provided
       if (refreshToken != null && refreshToken.isNotEmpty) {
@@ -136,20 +158,32 @@ class SecureStorage {
     }
   }
 
-  /// Retrieve Service Account configuration
+  /// Retrieve API Configuration (Service Account or API Key)
   Future<ApiConfiguration?> getApiConfiguration() async {
     try {
       final encryptedApiKey = await _secureStorage.read(key: _apiKeyKey);
       final encryptedProjectId = await _secureStorage.read(key: _projectIdKey);
-      final encryptedModelConfig =
-          await _secureStorage.read(key: _modelConfigKey);
+      final encryptedModelConfig = await _secureStorage.read(key: _modelConfigKey);
 
-      if (encryptedApiKey == null || encryptedProjectId == null) {
-        return null;
+      // Relaxed validation: If we have an API Key, we might not need project ID
+      String? apiKey;
+      if (encryptedApiKey != null) {
+          apiKey = await _decryptData(encryptedApiKey);
       }
-
-      final apiKey = await _decryptData(encryptedApiKey);
-      final projectId = await _decryptData(encryptedProjectId);
+      
+      String? projectId;
+      if (encryptedProjectId != null) {
+          projectId = await _decryptData(encryptedProjectId);
+      }
+      
+      // If we have neither, return null
+      if (apiKey == null && projectId == null) {
+          return null;
+      }
+      
+      // Use defaults if missing
+      projectId ??= '';
+      apiKey ??= '';
 
       Map<String, dynamic> modelConfig = {};
       if (encryptedModelConfig != null) {
@@ -157,20 +191,16 @@ class SecureStorage {
         modelConfig = jsonDecode(decryptedConfig);
       }
 
-      // Get service account (required)
+      // Get service account (optional now)
       String? serviceAccountJson;
-      final encryptedServiceAccount =
-          await _secureStorage.read(key: _serviceAccountKey);
+      final encryptedServiceAccount = await _secureStorage.read(key: _serviceAccountKey);
       if (encryptedServiceAccount != null) {
         serviceAccountJson = await _decryptData(encryptedServiceAccount);
-      } else {
-        return null;
       }
 
       // Get optional refresh token
       String? refreshToken;
-      final encryptedRefreshToken =
-          await _secureStorage.read(key: _refreshTokenKey);
+      final encryptedRefreshToken = await _secureStorage.read(key: _refreshTokenKey);
       if (encryptedRefreshToken != null) {
         refreshToken = await _decryptData(encryptedRefreshToken);
       }
@@ -178,8 +208,8 @@ class SecureStorage {
       return ApiConfiguration(
         apiKey: apiKey,
         projectId: projectId,
-        modelId: modelConfig['model_id'] ?? 'gemini-2.5-pro',
-        modelName: modelConfig['model_name'] ?? 'Gemini 2.5 Pro',
+        modelId: modelConfig['model_id'] ?? 'gemini-2.0-flash-exp', // Updated default
+        modelName: modelConfig['model_name'] ?? 'Gemini 2.0 Flash',
         region: modelConfig['region'] ?? 'us-central1',
         serviceAccountJson: serviceAccountJson,
         refreshToken: refreshToken,
@@ -191,6 +221,15 @@ class SecureStorage {
     } catch (e) {
       return null;
     }
+  }
+
+  /// Helper to get just the API Key
+  Future<String?> getApiKey() async {
+      final config = await getApiConfiguration();
+      if (config != null && config.apiKey.isNotEmpty) {
+          return config.apiKey;
+      }
+      return null;
   }
 
   /// Check if Service Account configuration exists
@@ -220,9 +259,10 @@ class SecureStorage {
   /// Update only the model configuration
   Future<void> updateModelConfiguration(String modelId) async {
     try {
-      if (!availableModels.containsKey(modelId)) {
-        throw ArgumentError('Unsupported model ID: $modelId');
-      }
+      // Relaxed validation for custom models
+      // if (!availableModels.containsKey(modelId)) {
+      //   throw ArgumentError('Unsupported model ID: $modelId');
+      // }
 
       final existingConfig = await getApiConfiguration();
       if (existingConfig == null) {
@@ -231,7 +271,7 @@ class SecureStorage {
 
       final modelConfig = {
         'model_id': modelId,
-        'model_name': availableModels[modelId]!['name'],
+        'model_name': availableModels[modelId]?['name'] ?? modelId,
         'saved_at': DateTime.now().toIso8601String(),
         'additional_config': existingConfig.additionalConfig,
       };

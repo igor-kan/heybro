@@ -59,8 +59,7 @@ class _PermissionScreenState extends State<PermissionScreen>
       // Check API configuration
       final config = await _secureStorage.getApiConfiguration();
       _isApiConfigured = config != null && 
-          config.projectId.isNotEmpty && 
-          config.serviceAccountJson != null;
+          config.apiKey.isNotEmpty;
 
       // Check accessibility permission
       _hasAccessibilityPermission = await _checkAccessibilityPermission();
@@ -379,7 +378,7 @@ class _PermissionScreenState extends State<PermissionScreen>
                       // Permission list
                       _buildPermissionListItem(
                         title: 'API Configuration',
-                        description: 'Configure Google Cloud Vertex AI credentials',
+                        description: 'Configure Gemini API Key',
                         isCompleted: _isApiConfigured,
                         onTap: _navigateToApiSettings,
                         icon: Icons.cloud_outlined,
