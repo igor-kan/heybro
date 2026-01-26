@@ -1,6 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:path_provider/path_provider.dart';
 import '../models/task.dart';
 import '../services/task_service.dart';
 import '../services/automation_service.dart';
@@ -73,6 +76,58 @@ class _TaskChatScreenState extends State<TaskChatScreen>
       }
     });
   }
+
+  Future<void> _exportChat() async {
+    if (_isProcessing) return;
+
+    try {
+      setState(() {
+        _isProcessing = true;
+      });
+
+      final taskExport = {
+        'task_info': {
+          'id': _currentTask!.id,
+          'title': _currentTask!.title,
+          'description': _currentTask!.description,
+          'created_at': _currentTask!.createdAt.toIso8601String(),
+          'status': _currentTask!.status.toString(),
+        },
+        'messages': _currentTask!.messages.map((m) => m.toJson()).toList(),
+        'logs': _currentTask!.logs.map((l) => l.toJson()).toList(),
+      };
+
+      final jsonString = const JsonEncoder.withIndent('  ').convert(taskExport);
+      final timestamp = DateTime.now().millisecondsSinceEpoch;
+      final fileName = 'chat_export_${_currentTask!.id}_$timestamp.json';
+
+      final tempDir = await getTemporaryDirectory();
+      final file = await File('${tempDir.path}/$fileName').create();
+      await file.writeAsString(jsonString);
+
+      if (mounted) {
+        // Use share_plus to export/share the file
+        await Share.shareXFiles(
+          [XFile(file.path)],
+          text: 'Chat Export: ${_currentTask!.title}',
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to export chat: $e')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isProcessing = false;
+        });
+      }
+    }
+  }
+
+
 
   @override
   void dispose() {
@@ -178,6 +233,11 @@ class _TaskChatScreenState extends State<TaskChatScreen>
   Future<void> _performAutomation() async {
     try {
       // Set up automation service callbacks to update the chat
+      _automationService.onLog = (type, content) async {
+         await _taskService.addLogToTask(_currentTask!.id, TaskLog(type: type, content: content));
+         _currentTask = _taskService.getTask(_currentTask!.id);
+      };
+
       _automationService.onMessage = (message) async {
         // Only show tool calls and technical output, filter out conversational text
         String? jsonData;
@@ -281,6 +341,18 @@ class _TaskChatScreenState extends State<TaskChatScreen>
         }
       };
       
+      // Listen for automation logs
+      _automationService.onLog = (type, content) async {
+         await _taskService.addLogToTask(_currentTask!.id, TaskLog(type: type, content: content));
+         _currentTask = _taskService.getTask(_currentTask!.id);
+      };
+
+      // Listen for automation logs
+      _automationService.onLog = (type, content) async {
+         await _taskService.addLogToTask(_currentTask!.id, TaskLog(type: type, content: content));
+         _currentTask = _taskService.getTask(_currentTask!.id);
+      };
+
       // Start the automation - either foreground service or regular automation
       if (_useForegroundService) {
         final success = await ForegroundAutomationService.startForegroundAutomation(_currentTask!.description);
@@ -388,6 +460,11 @@ class _TaskChatScreenState extends State<TaskChatScreen>
       _scrollToBottom();
       
       // Set up automation callbacks and start automation with the new message
+      _automationService.onLog = (type, content) async {
+         await _taskService.addLogToTask(_currentTask!.id, TaskLog(type: type, content: content));
+         _currentTask = _taskService.getTask(_currentTask!.id);
+      };
+
       _automationService.onMessage = (message) async {
         // Only show tool calls and technical output, filter out conversational text
         String? jsonData;
@@ -787,6 +864,30 @@ class _TaskChatScreenState extends State<TaskChatScreen>
                 ),
               ),
             ),
+          
+          // Export Chat Button
+           Padding(
+            padding: EdgeInsets.only(right: isTablet ? 16 : 12),
+            child: Material(
+              color: Colors.transparent,
+              child: InkWell(
+                onTap: _exportChat,
+                borderRadius: BorderRadius.circular(isTablet ? 16 : 12),
+                splashColor: const Color(0xFF4CAF50).withOpacity(0.1),
+                highlightColor: const Color(0xFF4CAF50).withOpacity(0.05),
+                child: Container(
+                  width: isTablet ? 48 : 40,
+                  height: isTablet ? 48 : 40,
+                  alignment: Alignment.center,
+                  child: Icon(
+                    Icons.download_rounded,
+                    size: isTablet ? 24 : 20,
+                    color: const Color(0xFF1B5E20),
+                  ),
+                ),
+              ),
+            ),
+          ),
         ],
       ),
 

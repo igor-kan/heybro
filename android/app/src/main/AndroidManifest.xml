@@ -85,6 +85,12 @@
             android:enabled="true"
             android:exported="false" />
 
+        <!-- A11y Overlay Service -->
+        <service
+            android:name=".A11yOverlayService"
+            android:enabled="true"
+            android:exported="false" />
+
         <!-- Voice Services -->
         <service
             android:name=".voice.EnhancedWakeWordService"

@@ -498,18 +498,51 @@ class ToolActivityManager(private val context: Context) {
     }
 
     suspend fun copyText(): Boolean {
-        Log.d(TAG, "📋 Copy text not implemented in TextInputActivity")
-        return false
+        return try {
+            Log.d(TAG, "📋 Delegating copy text to AccessibilityService")
+            val service = MyAccessibilityService.instance
+            if (service != null) {
+                service.performCopy()
+            } else {
+                Log.e(TAG, "❌ Accessibility service not available for copy")
+                false
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Copy error: ${e.message}", e)
+            false
+        }
     }
 
     suspend fun pasteText(): Boolean {
-        Log.d(TAG, "📋 Paste text not implemented in TextInputActivity")
-        return false
+        return try {
+            Log.d(TAG, "📋 Delegating paste text to AccessibilityService")
+            val service = MyAccessibilityService.instance
+            if (service != null) {
+                service.performPaste()
+            } else {
+                Log.e(TAG, "❌ Accessibility service not available for paste")
+                false
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Paste error: ${e.message}", e)
+            false
+        }
     }
 
     suspend fun cutText(): Boolean {
-        Log.d(TAG, "✂️ Cut text not implemented in TextInputActivity")
-        return false
+        return try {
+            Log.d(TAG, "✂️ Delegating cut text to AccessibilityService")
+            val service = MyAccessibilityService.instance
+            if (service != null) {
+                service.performCut()
+            } else {
+                Log.e(TAG, "❌ Accessibility service not available for cut")
+                false
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Cut error: ${e.message}", e)
+            false
+        }
     }
 
     suspend fun performBackspace(): Boolean {

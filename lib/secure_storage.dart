@@ -11,6 +11,8 @@ class SecureStorage {
   static const String _serviceAccountKey = 'vertex_ai_service_account';
   static const String _refreshTokenKey = 'vertex_ai_refresh_token';
   static const String _porcupineKeyKey = 'porcupine_access_key';
+  static const String _automationModeKey = 'automation_mode'; // 'vision_a11y' (default) or 'a11y_only'
+  static const String _a11yOverlayKey = 'a11y_overlay_enabled'; // 'true' or 'false'
 
   final FlutterSecureStorage _secureStorage;
 
@@ -404,6 +406,44 @@ class SecureStorage {
       return await _decryptData(encryptedKey);
     } catch (e) {
       return null;
+    }
+  }
+
+  /// Get Automation Mode ('vision_a11y' or 'a11y_only')
+  Future<String> getAutomationMode() async {
+    try {
+      final mode = await _secureStorage.read(key: _automationModeKey);
+      return mode ?? 'vision_a11y';
+    } catch (e) {
+      return 'vision_a11y';
+    }
+  }
+
+  /// Save Automation Mode
+  Future<void> saveAutomationMode(String mode) async {
+    try {
+      await _secureStorage.write(key: _automationModeKey, value: mode);
+    } catch (e) {
+      rethrow;
+    }
+  }
+
+  /// Check if A11y Overlay is enabled
+  Future<bool> isA11yOverlayEnabled() async {
+    try {
+      final enabled = await _secureStorage.read(key: _a11yOverlayKey);
+      return enabled == 'true';
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /// Save A11y Overlay setting
+  Future<void> saveA11yOverlayEnabled(bool enabled) async {
+    try {
+      await _secureStorage.write(key: _a11yOverlayKey, value: enabled.toString());
+    } catch (e) {
+      rethrow;
     }
   }
 

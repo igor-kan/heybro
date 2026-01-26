@@ -5,6 +5,10 @@ import '../screens/task_chat_screen.dart';
 import '../api_settings_screen.dart';
 import '../services/automation_service.dart';
 import '../services/foreground_automation_service.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:path_provider/path_provider.dart';
+import 'dart:io';
+import 'dart:convert';
 import 'dart:async';
 
 class TaskListScreen extends StatefulWidget {
@@ -321,6 +325,43 @@ class _TaskListScreenState extends State<TaskListScreen>
       await _taskService.deleteTask(task.id);
       if (mounted) {
         setState(() {});
+      }
+    }
+  }
+
+  Future<void> _exportTask(Task task) async {
+    try {
+      final taskExport = {
+        'task_info': {
+          'id': task.id,
+          'title': task.title,
+          'description': task.description,
+          'created_at': task.createdAt.toIso8601String(),
+          'status': task.status.toString(),
+        },
+        'messages': task.messages.map((m) => m.toJson()).toList(),
+        'logs': task.logs.map((l) => l.toJson()).toList(),
+      };
+
+      final jsonString = const JsonEncoder.withIndent('  ').convert(taskExport);
+      final timestamp = DateTime.now().millisecondsSinceEpoch;
+      final fileName = 'chat_export_${task.id}_$timestamp.json';
+
+      final tempDir = await getTemporaryDirectory();
+      final file = await File('${tempDir.path}/$fileName').create();
+      await file.writeAsString(jsonString);
+
+      if (mounted) {
+        await Share.shareXFiles(
+          [XFile(file.path)],
+          text: 'Chat Export: ${task.title}',
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to export task: $e')),
+        );
       }
     }
   }
@@ -877,9 +918,21 @@ class _TaskListScreenState extends State<TaskListScreen>
                         onSelected: (value) {
                           if (value == 'delete') {
                             _deleteTask(task);
+                          } else if (value == 'export') {
+                            _exportTask(task);
                           }
                         },
                         itemBuilder: (context) => [
+                          const PopupMenuItem(
+                            value: 'export',
+                            child: Row(
+                              children: [
+                                Icon(Icons.download_rounded, color: Color(0xFF2E7D32), size: 20),
+                                SizedBox(width: 12),
+                                Text('Export Task', style: TextStyle(fontWeight: FontWeight.w500)),
+                              ],
+                            ),
+                          ),
                           const PopupMenuItem(
                             value: 'delete',
                             child: Row(

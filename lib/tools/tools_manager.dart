@@ -166,6 +166,16 @@ class ToolsManager {
         case 'execute_user_task':
           return await _executeUserTask(parameters);
 
+        case 'get_screen_dimensions':
+          return await _getScreenDimensions();
+
+        case 'copy_text':
+          return await _copyText();
+        case 'paste_text':
+          return await _pasteText();
+        case 'cut_text':
+          return await _cutText();
+
         default:
           return {
             'success': false,
@@ -289,6 +299,19 @@ class ToolsManager {
       return {
         'success': false,
         'error': 'Failed to get current app: $e',
+        'data': null
+      };
+    }
+  }
+
+  static Future<Map<String, dynamic>> _getScreenDimensions() async {
+    try {
+      final result = await _toolsChannel.invokeMethod('getScreenDimensions');
+      return {'success': true, 'data': result, 'error': null};
+    } catch (e) {
+      return {
+        'success': false,
+        'error': 'Failed to get screen dimensions: $e',
         'data': null
       };
     }
@@ -714,6 +737,23 @@ class ToolsManager {
       return {
         'success': false,
         'error': 'Failed to paste text: $e',
+        'data': null
+      };
+    }
+  }
+
+  static Future<Map<String, dynamic>> _cutText() async {
+    try {
+      final result = await _toolsChannel.invokeMethod('cutText');
+      return {
+        'success': result == true,
+        'data': null,
+        'error': result == true ? null : 'Cut text failed'
+      };
+    } catch (e) {
+      return {
+        'success': false,
+        'error': 'Failed to cut text: $e',
         'data': null
       };
     }

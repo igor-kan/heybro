@@ -3,6 +3,8 @@ import 'dart:async';
 import 'package:flutter/services.dart';
 import '../gemini_client.dart';
 import '../tools/tools_manager.dart';
+import 'automation/automation_models.dart';
+import '../secure_storage.dart';
 
 class AutomationService {
   // Singleton pattern
@@ -18,6 +20,7 @@ class AutomationService {
   Function(String)? onError;
   Function()? onComplete;
   Function(bool)? onAutomationStateChanged;
+  Function(String type, String content)? onLog;
 
   // Service state
   bool _isAutomating = false;
@@ -29,7 +32,7 @@ class AutomationService {
 
   // Task state
   String? _currentTask;
-  List<Map<String, dynamic>> _taskHistory = [];
+  AutomationSession? _session;
   List<String> _installedApps = [];
   int _currentStep = 0;
   
@@ -54,6 +57,12 @@ class AutomationService {
   bool get isInitialized => _isInitialized;
   Map<String, dynamic>? get lastTapCoordinates => _lastTapCoordinates;
 
+  // Settings
+  bool _useVision = true;
+  bool _showOverlay = false;
+  SecureStorage? _secureStorage;
+  ToolsManager _toolsManager = ToolsManager();
+
   /// Initialize the automation service
   Future<void> initialize() async {
     if (_isInitialized) {
@@ -71,6 +80,9 @@ class AutomationService {
       // Initialize AI client
       _aiClient = GeminiClient();
       await _aiClient!.initialize();
+      
+      _secureStorage = SecureStorage();
+      await _secureStorage!.initialize();
 
       // Skip AI testing - start automation instantly
       _isInitialized = true;
@@ -134,7 +146,7 @@ class AutomationService {
     }
 
     _currentTask = userMessage;
-    _taskHistory.clear();
+    _session = AutomationSession(task: userMessage); // Initialize session
     _currentStep = 0;
     _processedFields.clear(); // Reset field tracking for new task
     _lastTappedField = null;
@@ -142,6 +154,24 @@ class AutomationService {
     _visionModeReason = null;
     _isAutomating = true;
     _installedApps.clear(); // Clear previous apps list
+    
+    // Clear overlay
+    try {
+       const agentChannel = MethodChannel('com.vibeagent.dude/agent');
+       await agentChannel.invokeMethod('clearA11yOverlay');
+    } catch (_) {}
+    
+    // Refresh settings
+    try {
+      if (_secureStorage != null) {
+        final mode = await _secureStorage!.getAutomationMode();
+        _useVision = mode == 'vision_a11y';
+        _showOverlay = await _secureStorage!.isA11yOverlayEnabled();
+        print('⚙️ Automation Settings - Mode: $mode, Overlay: $_showOverlay');
+      }
+    } catch (e) {
+      print('⚠️ Failed to load settings: $e');
+    }
     
     // Notify UI that automation state changed to true
     onAutomationStateChanged?.call(true);
@@ -187,6 +217,13 @@ class AutomationService {
       // Notify UI that automation state changed to false
       onAutomationStateChanged?.call(false);
       _notifyMessage('🛑 Automation stopped by user');
+      
+      // Clear overlay
+      try {
+         const agentChannel = MethodChannel('com.vibeagent.dude/agent');
+         agentChannel.invokeMethod('clearA11yOverlay');
+      } catch (_) {}
+      
       // Notify Android to send broadcast for voice service overlay closing
       _notifyComplete();
     }
@@ -219,13 +256,24 @@ class AutomationService {
       // Reset force refresh flag
       forceContextRefresh = false;
 
+      // Calculate screen hash for loop detection
+      final int screenHash = screenContext.toString().hashCode;
+      
+      // Check for loops
+      final loopResult = _session != null 
+          ? LoopDetection.check(_session!.recentActions) 
+          : LoopResult(isLoop: false);
+
+      if (loopResult.isLoop) {
+        print('🔄 LOOP DETECTED: ${loopResult.suggestion}');
+      }
+
       // Build AI prompt with visual context and strict validation rules
-      final prompt = _buildStepPrompt(screenContext);
+      final prompt = _buildStepPrompt(screenContext, loopResult: loopResult);
 
       // Extract image for Vision Fallback if available
       String? visionImage;
-      if (screenContext['vision_fallback_active'] == true &&
-          screenContext['low_quality_screenshot'] is String) {
+      if (screenContext['low_quality_screenshot'] is String) {
         visionImage = screenContext['low_quality_screenshot'];
       }
 
@@ -251,7 +299,7 @@ class AutomationService {
       previousContext = Map<String, dynamic>.from(screenContext);
 
       // Execute the AI's decision
-      final shouldContinue = await _processAIDecision(aiResponse);
+      final shouldContinue = await _processAIDecision(aiResponse, screenHash);
       if (!shouldContinue) {
         break;
       }
@@ -336,81 +384,83 @@ class AutomationService {
       }
 
       // Try to take screenshot
-      final screenshotResult = await ToolsManager.executeTool('take_screenshot', {});
+      Map<String, dynamic> screenshotResult = {'success': false};
+      
+      // Only take screenshot if vision is enabled
+      if (_useVision) {
+          screenshotResult = await ToolsManager.executeTool('take_screenshot', {});
+      } else {
+          print('📷 Vision disabled by settings - skipping screenshot');
+      }
+      
       final screenshotAvailable = screenshotResult['success'] == true;
       print('🔍 screenshotResult: success=${screenshotResult['success']}, data type=${screenshotResult['data']?.runtimeType}');
+      
+      // Update Overlay if enabled
+      if (_showOverlay && accessibilityTree.isNotEmpty) {
+         try {
+            // Filter elements that have bounds
+            final validElements = screenElements.where((e) => e is Map && e['bounds'] != null).toList();
+            if (validElements.isNotEmpty) {
+               const agentChannel = MethodChannel('com.vibeagent.dude/agent');
+               await agentChannel.invokeMethod('updateA11yOverlay', {'elements': validElements});
+            }
+         } catch (e) {
+           print('⚠️ Error updating overlay: $e');
+         }
+      }
 
       // Fallback to OCR/Vision when accessibility tree is empty or likely web content
       String ocrText = '';
       List<dynamic> ocrBlocks = const [];
       String? lowQualityScreenshotBase64;
-      // Use persistent vision mode if already triggered, or evaluate conditions
-      // Default to false - only enable if we successfully prepare visual context
-      bool visionFallbackActive = false;
+      
+      // Vision state
+      bool visionActive = false;
+      bool visionRescueMode = false;
 
       final isA11yEmpty = accessibilityTree.isEmpty;
-      final classHints = _collectClassHints(accessibilityTree);
-      final looksLikeWeb = classHints.any((c) =>
-          c.contains('WebView') ||
-          c.contains('webview') ||
-          c.contains('ComposeView'));
       
-      // Check for consecutive screenshot calls in history
-      bool stuckOnScreenshot = false;
-      if (_taskHistory.length >= 2) {
-        final lastAction = _taskHistory.last['action'];
-        final secondLastAction = _taskHistory[_taskHistory.length - 2]['action'];
-        if (lastAction == 'take_screenshot' && secondLastAction == 'take_screenshot') {
-          stuckOnScreenshot = true;
-          print('⚠️ Detected consecutive screenshot calls - triggering Vision Fallback');
-        }
-      }
-
       Map<String, double>? contextDimensions = {};
 
-      // Run vision capture if:
-      // 1. Vision mode is already persistently enabled, OR
-      // 2. Any of the initial trigger conditions are met
-      final shouldActivateVision = _visionModePersistent || isA11yEmpty || looksLikeWeb || stuckOnScreenshot;
-      
-      if (shouldActivateVision && screenshotAvailable) {
-        final screenshotB64 = (screenshotResult['data'] as String?);
-        if (screenshotB64 != null && screenshotB64.isNotEmpty) {
-          // Log reason for vision mode
-          if (_visionModePersistent) {
-            print('🔒 Vision Mode ACTIVE (persistent from: $_visionModeReason)');
-          } else {
-            print('🟡 Triggering Vision Fallback (Reason: ${stuckOnScreenshot ? 'stuck on screenshot' : (isA11yEmpty ? 'empty tree' : 'web content')})');
-          }
-
-          // 1. Vision Capture (Reliable: Resize existing screenshot)
-          try {
-            print(
-                '📸 Processing vision fallback image (Compressing for speed, keeping original dims)...');
-            final lqResult = await ToolsManager.executeTool('resize_image', {
-              'base64Image': screenshotB64,
-              'targetWidth': 3000, // Keep original dimensions (don't resize unless huge)
-              'quality': 40 // Lower quality to reduce size while keeping resolution
-            });
-            if (lqResult['success'] == true && lqResult['data'] is String) {
-              lowQualityScreenshotBase64 = lqResult['data'];
-              visionFallbackActive = true;
-              
-              // PERSIST vision mode for the rest of the task
-              if (!_visionModePersistent) {
-                _visionModePersistent = true;
-                _visionModeReason = stuckOnScreenshot ? 'stuck_on_screenshot' : (isA11yEmpty ? 'empty_tree' : 'web_content');
-                print('🔒 Vision mode LOCKED ON - will stay active for entire task');
+      // Analyze Vision if enabled by settings
+      String? screenshotB64;
+      if (_useVision && screenshotAvailable) {
+          screenshotB64 = (screenshotResult['data'] as String?);
+          if (screenshotB64 != null && screenshotB64.isNotEmpty) {
+              // 1. Process Vision Image
+              try {
+                print('📸 Processing vision image (Compressing for AI)...');
+                final lqResult = await ToolsManager.executeTool('resize_image', {
+                  'base64Image': screenshotB64,
+                  'targetWidth': 3000, 
+                  'quality': 40 
+                });
+                
+                if (lqResult['success'] == true && lqResult['data'] is String) {
+                  lowQualityScreenshotBase64 = lqResult['data'];
+                  visionActive = true;
+                  
+                  // Only trigger Rescue Mode (Full Vision Prompt) if A11y is completely broken
+                  if (isA11yEmpty) {
+                    visionRescueMode = true;
+                    print('⚠️ Vision Rescue Mode ACTIVE (Reason: Empty Accessibility Tree)');
+                  } else {
+                    print('👁️ Vision Active (Enhancing Standard Prompt)');
+                  }
+                  
+                } else {
+                  print('❌ Vision resize failed: ${lqResult['error']}');
+                }
+              } catch (e) {
+                print('❌ Vision capture failed: $e');
               }
-              print('✅ Vision capture successful (Resized)');
-            } else {
-              print('❌ Vision resize failed: ${lqResult['error']}');
-            }
-          } catch (e) {
-            print('❌ Vision capture failed: $e');
           }
+      }
 
-          // 2. OCR (Existing Logic - keep as supplementary)
+      // 2. OCR (Existing Logic - keep as supplementary)
+      // Only run OCR if we have a screenshot
+      if (screenshotB64 != null && screenshotB64.isNotEmpty) {
           final ocrResult = await ToolsManager.executeTool('perform_ocr', {
             'screenshot': screenshotB64,
           });
@@ -436,16 +486,13 @@ class AutomationService {
           } else {
             print('❌ OCR failed: ${ocrResult['error']}');
           }
+      }
 
-          // Store vision dimensions if active
-          if (visionFallbackActive) {
+            // Store vision dimensions if active or image available
+          if (lowQualityScreenshotBase64 != null) {
             contextDimensions ??= {};
-            // We are now keeping original dimensions, so vision width matches device/OCR width
-            // Set it to OCR width if available, or 0 (which disables scaling)
             contextDimensions!['visionImageWidth'] = contextDimensions['ocrImageWidth'] ?? 0.0;
           }
-        }
-      }
 
       print('📊 Context captured - App: ${currentApp['packageName'] ?? 'Unknown'}, Elements: ${screenElements.length}, Tree: ${accessibilityTree.length}');
 
@@ -457,12 +504,15 @@ class AutomationService {
         'screenshot_available': screenshotAvailable,
         'ocr_text': ocrText,
         'ocr_blocks': ocrBlocks,
+        'ocr_blocks': ocrBlocks,
         'ocr_image_width': (contextDimensions['ocrImageWidth'] ?? 0.0),
         'ocr_image_height': (contextDimensions['ocrImageHeight'] ?? 0.0),
         'vision_image_width': (contextDimensions['visionImageWidth'] ?? 0.0),
         'low_quality_screenshot': lowQualityScreenshotBase64,
-        'vision_fallback_active': visionFallbackActive,
-        'vision_fallback_reason': stuckOnScreenshot ? 'stuck_on_screenshot' : (isA11yEmpty ? 'empty_tree' : 'web_content'),
+        'vision_active': visionActive,
+        'vision_rescue_mode': visionRescueMode,
+        'vision_fallback_active': visionRescueMode, // Keep for prompt compatibility (triggers Rescue Prompt)
+        'vision_fallback_reason': visionRescueMode ? 'empty_tree' : (visionActive ? 'settings' : null),
         'timestamp': DateTime.now().millisecondsSinceEpoch,
       };
 
@@ -486,11 +536,14 @@ class AutomationService {
         'current_app': <String, dynamic>{},
         'screen_elements': <dynamic>[],
         'accessibility_tree': <dynamic>[],
+        'system_dialogs': <dynamic>[],
         'screenshot_available': false,
         'ocr_text': '',
         'ocr_blocks': <dynamic>[],
         'ocr_image_width': 0.0,
         'ocr_image_height': 0.0,
+        'vision_active': false,
+        'vision_rescue_mode': false,
         'error': e.toString(),
       };
       // Reset field tracking on error (likely screen change)
@@ -561,14 +614,14 @@ bool _isContextIdentical(Map<String, dynamic> prev, Map<String, dynamic> current
   }
 }
 
-String _buildVisionStepPrompt(Map<String, dynamic> context) {
-  // Build history summary
+String _buildVisionStepPrompt(Map<String, dynamic> context, {LoopResult? loopResult}) {
+  // Build recent history summary
   String historyText = '';
-  if (_taskHistory.isNotEmpty) {
-    historyText = '\nCOMPLETED STEPS:\n';
-    for (int i = 0; i < _taskHistory.length; i++) {
-        final step = _taskHistory[i];
-        historyText += '${i + 1}. ${step['action']} - ${step['description']}\n';
+  if (_session != null && _session!.recentActions.isNotEmpty) {
+    historyText = '\nRECENT ACTIONS (Last ${_session!.recentActions.length}):\n';
+    for (int i = 0; i < _session!.recentActions.length; i++) {
+        final step = _session!.recentActions[i];
+        historyText += '${i + 1}. ${step.action} - Result: ${step.result}\n';
     }
   }
 
@@ -581,6 +634,7 @@ Standard accessibility data has FAILED. You must rely on the SCREENSHOT to under
 🎯 PRIMARY GOAL: $_currentTask
 Step: $_currentStep
 History: $historyText
+${loopResult?.isLoop == true ? '\n⚠️ LOOP WARNING: ${loopResult?.suggestion}\n' : ''}
 
 🖼️ VISUAL INTELLIGENCE
 - The provided image is the REAL-TIME screen state.
@@ -628,10 +682,10 @@ I will tap it.
 ''';
 }
 
-String _buildStepPrompt(Map<String, dynamic> context) {
+String _buildStepPrompt(Map<String, dynamic> context, {LoopResult? loopResult}) {
   // Dispatch to specialized Vision Mode prompt if active
   if (context['vision_fallback_active'] == true) {
-    return _buildVisionStepPrompt(context);
+    return _buildVisionStepPrompt(context, loopResult: loopResult);
   }
 
   final currentApp = context['current_app'] is Map
@@ -649,7 +703,9 @@ String _buildStepPrompt(Map<String, dynamic> context) {
   final hasScreenshot = context['screenshot_available'] == true;
   final ocrText = context['ocr_text'] is String ? (context['ocr_text'] as String) : '';
   final hasOcr = ocrText.isNotEmpty;
-  final visionActive = context['vision_fallback_active'] == true;
+  final visionActive = context['vision_active'] == true || context['vision_fallback_active'] == true;
+  final visionRescueMode = context['vision_rescue_mode'] == true;
+  
   // Extract simple hints for form inputs from a11y and OCR
   final inputHints = <String>[];
   final a11y = context['accessibility_tree'];
@@ -671,147 +727,24 @@ String _buildStepPrompt(Map<String, dynamic> context) {
     }
   }
 
-  // Build history summary
+  // Build history summary from Session
   String historyText = '';
-  if (_taskHistory.isNotEmpty) {
-    historyText = '\nCOMPLETED STEPS:\n';
-    for (int i = 0; i < _taskHistory.length; i++) {
-      final step = _taskHistory[i];
-      historyText += '${i + 1}. ${step['action']} - ${step['description']}\n';
+  if (_session != null && _session!.recentActions.isNotEmpty) {
+    historyText = '\nRECENT HISTORY (Last ${_session!.recentActions.length}):\n';
+    for (final step in _session!.recentActions) {
+      historyText += '• ${step.action} - ${step.result}\n';
     }
   }
-
-  // LEGACY PROMPT - COMMENTED OUT FOR REFERENCE
-  /*
-  return '''
-You are an advanced Android automation AI with the sole responsibility of executing user-defined tasks step-by-step with maximum precision, reliability, and context-awareness. You function inside a task orchestration environment where every detail of the screen, accessibility data, OCR, and system dialogs is provided to you for exact decision-making. Your objective is always task completion.... every step you output must move closer to the defined goal.  
-
-🎯 CURRENT TASK CONTEXT  
-- Task: $_currentTask  
-- Execution Step: $_currentStep  
-- Progress History: $historyText  
-
-📱 SCREEN CONTEXT ANALYSIS  
-- Screenshot Available: $hasScreenshot  
-- Interactive Elements Count: ${screenElements.length}  
-- Accessibility Elements Count: ${accessibilityTree.length}  
-- System Dialogs: ${systemDialogs.length}  
-- OCR Text Available: $hasOcr  
-- Editable Field Hints: ${inputHints.isEmpty ? '[]' : inputHints}  
-
-🔘 INTERACTIVE ELEMENTS  
-${_formatElements(screenElements)}  
-
-🌳 ACCESSIBILITY TREE  
-${_formatAccessibilityTree(accessibilityTree)}  
-
-💬 SYSTEM DIALOGS  
-${systemDialogs.isNotEmpty ? _formatSystemDialogs(systemDialogs) : '[No system dialogs detected]'}  
-
-🔍 OCR EXTRACTED TEXT  
-${hasOcr ? ocrText : '[No OCR text available]'}  
-
----
-
-🎯 CRITICAL TASK EXECUTION PRINCIPLES  
-1. FRESH CONTEXT ANALYSIS.... You MUST analyze the CURRENT screen state completely fresh each time. DO NOT make assumptions based on previous steps.  
-2. DYNAMIC DECISION MAKING.... Every decision must be based ONLY on the current context provided. Ignore any mental models from previous steps.  
-3. SCREEN STATE VALIDATION.... Before each action, verify the current screen matches your expectations. If not, reassess completely.  
-4. Task-First Approach.... Always prioritize the user's requested task, not the current screen context.  
-5. App Routing.... If the task requires another app, immediately open it (ignore current context).  
-6. Context-Specific Routing....  
-   • Food/Restaurant → Zomato, Swiggy, UberEats  
-   • Transport → Uber, Ola, Google Maps  
-   • Shopping → Amazon, Flipkart  
-   • Communication → WhatsApp, Gmail, SMS  
-   • Entertainment → YouTube, Netflix, Spotify  
-7. Search Optimization.... Always locate and activate search input before typing queries.  
-8. Form Handling.... Multi-field forms must be filled sequentially in correct logical order.  
-
----
-
-🚨 STRICT EXECUTION PROTOCOLS  
-- MANDATORY: Analyze current context completely fresh - no assumptions from previous steps  
-- MANDATORY: Verify screen state matches expectations before proceeding  
-- MANDATORY: Use precise OCR bounds for tapping when available - calculate exact center coordinates  
-- MANDATORY SCROLL PROTOCOL: Before ANY scroll action, thoroughly analyze current accessibility tree and OCR text to verify target content is NOT already visible on screen  
-- MANDATORY POST-SCROLL: After scroll actions, ALWAYS wait for fresh context capture (updated a11y tree + OCR) before making next decision  
-- MANDATORY SCROLL VALIDATION: Check if target text/element exists in current context before scrolling - avoid unnecessary scrolls  
-- One action per response.  
-- Always follow natural UI flows (tap → type → confirm).  
-- Use accessibility indices whenever possible.  
-- If accessibility unavailable, use OCR bounds with precise coordinate calculation.  
-- Only use manual coordinates if no other methods succeed.  
-- Always click/focus input fields before typing.  
-- Validate every typed input, retry with alternate methods if needed.  
-- Element indexes start at 0 and must match the given lists.  
-- OCR bounds format: {"left":x,"top":y,"right":x2,"bottom":y2} - tap at center: ((left+right)/2, (top+bottom)/2)  
-
----
-
-⚡ AVAILABLE ACTIONS (must be used exactly as specified for precision):  
-• take_screenshot  
-• tap_element_by_text {"text": "..."}  
-• tap_element_by_index {"index": number}  
-• tap_element_by_bounds {"left":..,"top":..,"right":..,"bottom":..}  
-• tap_ocr_text {"text": "..."}  
-• tap_ocr_bounds {"left":..,"top":..,"right":..,"bottom":..}  
-• perform_tap {"x":..,"y":..}  
-• perform_long_press {"x":..,"y":..}  
-• perform_swipe {"startX":..,"startY":..,"endX":..,"endY":..}  
-• perform_scroll {"direction": "up/down/left/right"} - ONLY use after verifying target is NOT in current context  
-• perform_dynamic_scroll {"direction": "up/down/left/right","targetText":"...","maxScrollAttempts":n} - ONLY use after verifying target is NOT in current context  
-• type_text {"text": "..."}  
-• focus_input_field {"x":..,"y":..,"text":"...","className":"..."}  
-• advanced_type_text {"text":"...","clearFirst":true/false,"delayMs":n}  
-• clear_text_field {"x":..,"y":..,"text":"..."}  
-• replace_text_field {"x":..,"y":..,"text":"old_text","newText":"..."}  
-• fill_form_fields {"fields":[{"type":"...","value":"...","selector":"..."}]}  
-• open_app_by_name {"appName":"..."}  
-• perform_back  
-• perform_home  
-• perform_enter  
-
-🔄 SCROLL DECISION MATRIX:  
-1. BEFORE SCROLL: Search current accessibility tree + OCR text for target content  
-2. IF FOUND: Use tap_element_by_text, tap_element_by_index, or tap_ocr_text instead  
-3. IF NOT FOUND: Proceed with scroll action  
-4. AFTER SCROLL: Wait for next context refresh to analyze updated screen state  
-
----
-
-📋 FORM PROCESSING STRATEGY  
-1. Identify editable fields (via accessibility tree + OCR).  
-2. Determine field types (email, subject, body, search, etc.).  
-3. Focus precisely on field (accessibility > OCR > coordinates).  
-4. Input using advanced_type_text with clearFirst if pre-filled.  
-5. Handle suggestions/dropdowns by tapping relevant OCR text.  
-6. Validate input → retry if incorrect.  
-7. Continue field-by-field until form completion.  
-
----
-
-✅ CRITICAL RESPONSE FORMAT  
-You must only respond with raw JSON in the following structure:  
-{
-  "action": "action_name",
-  "parameters": {"key": "value"},
-  "description": "What this step does",
-  "is_complete": false,
-  "reasoning": "Why this action"
-}  
-
-- If task is finished, "is_complete": true.  
-- Never output text, explanations, or code fences outside the JSON.  
-
----
-
-⚖️ DECISION PRIORITY  
-1. Accessibility elements (most precise)  
-2. OCR text/bounds (if accessibility missing)  
-3. Manual coordinates (last resort)  
-''';  
-  */
+  
+  // Session Summary
+  String sessionSummary = '';
+  if (_session != null) {
+    sessionSummary = '''
+\n📊 SESSION STATUS:
+- Phase: ${_session!.currentPhase}
+- Milestones: ${_session!.milestones.join(', ')}
+''';
+  }
 
   // ENHANCED HUMAN-LIKE AUTOMATOR AI AGENT PROMPT - CHAIN OF THOUGHT ENABLED
   String prompt = '''
@@ -820,8 +753,10 @@ You are an intelligent mobile automation agent that mimics human interaction pat
 
 🎯 MISSION BRIEFING
 - Primary Task: $_currentTask
-- Current Step: $_currentStep
-- Journey So Far: $historyText
+- Current Phase: ${_session?.currentPhase ?? 'executing'}
+- Recent History: $historyText
+$sessionSummary
+${loopResult?.isLoop == true ? '\n⚠️ LOOP DETECTED: ${loopResult?.suggestion}\n' : ''}
 
 📱 CURRENT SCREEN INTELLIGENCE
 - Interactive Elements: ${screenElements.length} available
@@ -841,7 +776,7 @@ ${systemDialogs.isNotEmpty ? _formatSystemDialogs(systemDialogs) : '[Clean scree
 
 👁️ VISUAL TEXT RECOGNITION (OCR)
 ${hasOcr ? ocrText : '[No readable text detected on screen]'}
-${visionActive ? '\n⚠️ VISION FALLBACK ACTIVE: ${context['vision_fallback_reason'] == 'stuck_on_screenshot' ? 'You are stuck calling take_screenshot repeatedly. Use the visual screenshot to find elements and TAP COORDINATES directly.' : 'Accessibility tree is limited. I have provided a visual screenshot. use perform_tap with {x,y} coordinates.'}' : ''}
+${visionActive ? (visionRescueMode ? '\n⚠️ VISION RESCUE MODE ACTIVE: Accessibility tree is empty or broken. Use the visual screenshot to find elements and perform_tap with coordinates.' : '\n👁️ VISION CONTEXT AVAILABLE: You have access to a real-time screenshot. Use it to verify elements or tap using coordinates if accessibility is incomplete.') : ''}
 
 📦 INSTALLED APPS INVENTORY (Launchable)
 ${_installedApps.isEmpty ? '[No apps detected]' : _installedApps.join(', ')}
@@ -983,7 +918,11 @@ Action: $_lastFailedAction
 
       _llmRequestOngoing = true;
       _lastLlmRequestedAt = DateTime.now();
+      _lastLlmRequestedAt = DateTime.now();
       print('🧠 Sending prompt to AI${image != null ? ' (with image)' : ''}...');
+
+      // Log prompt
+      onLog?.call('prompt', prompt);
 
       String? response;
       if (image != null) {
@@ -993,9 +932,13 @@ Action: $_lastFailedAction
       }
 
       if (response == null || response.isEmpty) {
+        onLog?.call('error', 'Empty response from AI');
         print('❌ Empty response from AI');
         return null;
       }
+      
+      // Log raw response
+      onLog?.call('response', response);
 
       print('🤖 AI Response received');
       print('📄 Raw response: $response');
@@ -1053,7 +996,7 @@ Action: $_lastFailedAction
   }
 
   /// Process and execute AI decision
-  Future<bool> _processAIDecision(Map<String, dynamic> decision) async {
+  Future<bool> _processAIDecision(Map<String, dynamic> decision, int screenHash) async {
     try {
       // Extract action details (may still be present even if is_complete=true)
       final isComplete = decision['is_complete'] == true;
@@ -1080,18 +1023,15 @@ Action: $_lastFailedAction
         success = await _executeAction(action, parameters);
       }
 
-      // Record in history with enhanced metadata
-      _taskHistory.add({
-        'step': _currentStep,
-        'action': action ?? '',
-        'description': (description ?? action) ?? '',
-        'success': success,
-        'timestamp': DateTime.now().millisecondsSinceEpoch,
-        'parameters': parameters,
-        'ui_context': _extractUIContext(action ?? '', parameters, description),
-        'interaction_type':
-            _classifyInteractionType(action ?? '', parameters, description),
-      });
+      // Record in session
+      if (_session != null) {
+        _session!.addAction(
+          action ?? 'unknown',
+          parameters,
+          success ? 'Success' : 'Failed',
+          screenHash
+        );
+      }
 
       // If action failed, treating it as a step failure for retry logic
       if (!success && !isComplete) {
@@ -1166,21 +1106,15 @@ Action: $_lastFailedAction
     // Check for common shortcut patterns
     if (action == 'type_text') {
       // Check if we recently clicked on an input field or search button
-      final recentActions = _taskHistory.length >= 2
-          ? _taskHistory.sublist(_taskHistory.length - 2)
-          : _taskHistory;
-
+      final recentActions = _session != null ? _session!.recentActions : <ActionRecord>[];
+      
       final hasRecentInputInteraction = recentActions.any((step) {
-        final uiContext = step['ui_context'] as Map<String, dynamic>? ?? {};
-        final interactionType = step['interaction_type'] as String? ?? '';
-
-        return uiContext['is_input_interaction'] == true ||
-            uiContext['is_search_related'] == true ||
-            interactionType == 'search_initiation' ||
-            interactionType == 'ui_element_click';
+        // Simple check based on action name since we lost UI context in ActionRecord for now
+        // TODO: Enhance ActionRecord to store interaction type if needed
+        return step.action.contains('tap') || step.action.contains('click');
       });
 
-      if (!hasRecentInputInteraction && _taskHistory.isNotEmpty) {
+      if (!hasRecentInputInteraction && recentActions.isNotEmpty) {
         _notifyMessage(
             '🚫 SHORTCUT DETECTED: Cannot type text without first clicking an input field or search button');
         return false;
@@ -1192,13 +1126,10 @@ Action: $_lastFailedAction
         (_currentTask?.toLowerCase().contains('search') ?? false)) {
       final text = parameters['text'] as String? ?? '';
       if (text.isNotEmpty) {
-        final recentSearchClick = _taskHistory.any((step) {
-          final interactionType = step['interaction_type'] as String? ?? '';
-          final uiContext = step['ui_context'] as Map<String, dynamic>? ?? {};
-
-          return interactionType == 'search_initiation' ||
-              (uiContext['is_search_related'] == true &&
-                  uiContext['is_button_click'] == true);
+        final recentActions = _session != null ? _session!.recentActions : <ActionRecord>[];
+        final recentSearchClick = recentActions.any((step) {
+          // Simplified check
+           return step.action.contains('tap') || step.action.contains('click');
         });
 
         if (!recentSearchClick) {
@@ -1817,16 +1748,50 @@ Action: $_lastFailedAction
         }
 
         // Convert normalized coordinates (0-1000) to device pixels
-        final w = (_lastContext?['ocr_image_width'] as num?)?.toDouble() ?? 0.0;
-        final h = (_lastContext?['ocr_image_height'] as num?)?.toDouble() ?? 0.0;
+        // CRITICAL FIX: ocr_image_width might be the RESIZED image width (e.g. 480p).
+        // performTap expects ACTUAL DEVICE PIXELS (e.g. 1080p).
+        // 0-1000 coordinates are relative to the image content, so mapping them to 0-1000 of Screen Width works.
+        // We must normalize against SCREEN RESOLUTION, not image resolution.
+
+        double w = 0.0;
+        double h = 0.0;
+        
+        // Try getting cached screen dims first (if we stored them)
+        if (_lastContext != null && _lastContext!.containsKey('screen_width')) {
+             w = (_lastContext?['screen_width'] as num?)?.toDouble() ?? 0.0;
+             h = (_lastContext?['screen_height'] as num?)?.toDouble() ?? 0.0;
+        }
+
+        if (w <= 0 || h <= 0) {
+             // Fetch real dimensions from device
+             final dims = await ToolsManager.executeTool('get_screen_dimensions', {});
+             if (dims['success'] == true && dims['data'] is Map) {
+                 final d = dims['data'];
+                 w = (d['width'] as num?)?.toDouble() ?? 0.0;
+                 h = (d['height'] as num?)?.toDouble() ?? 0.0;
+                 
+                 // Cache for this session
+                 if (_lastContext != null) {
+                    _lastContext!['screen_width'] = w;
+                    _lastContext!['screen_height'] = h;
+                 }
+             }
+        }
         
         if (w > 0 && h > 0) {
-             _notifyMessage('📏 Normalizing tap: ($x, $y)');
+             _notifyMessage('📏 Normalizing vision tap (0-1000) to screen ${w.round()}x${h.round()}');
              x = (x / 1000.0) * w;
              y = (y / 1000.0) * h;
-             _notifyMessage('📍 Converted to pixels: (${x!.round()}, ${y!.round()}) for screen ${w.round()}x${h.round()}');
+             _notifyMessage('📍 Converted to pixels: (${x!.round()}, ${y!.round()})');
         } else {
-             _notifyMessage('⚠️ Missing screen dimensions, using raw coordinates (risk of error)');
+             // Use fallback or previous incorrect behavior?
+             // If we can't get screen dims, we might default to 1080x1920 or fail?
+             // Defaulting to 1080x1920 is safer than 0x0
+             _notifyMessage('⚠️ Could not get screen dimensions. Assuming default 1080x1920.');
+             w = 1080.0;
+             h = 1920.0;
+             x = (x / 1000.0) * w;
+             y = (y / 1000.0) * h;
         }
         
         _notifyMessage('👁️ Vision tap: "$description" at (${x!.round()}, ${y!.round()})');

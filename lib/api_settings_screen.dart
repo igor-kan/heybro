@@ -26,6 +26,13 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
   String _selectedModel = 'gemini-2.5-flash';
   bool _isCustomModel = false;
   
+  // Automation Settings
+  String _automationMode = 'vision_a11y';
+  bool _a11yOverlayEnabled = false;
+  bool _hasOverlayPermission = false;
+  
+
+  
   final List<String> _commonModels = [
     'gemini-2.5-flash',
     'gemini-2.5-pro',
@@ -37,7 +44,30 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
   @override
   void initState() {
     super.initState();
+    _checkOverlayPermission();
     _initializeStorage();
+  }
+
+  Future<void> _checkOverlayPermission() async {
+    const channel = MethodChannel('com.vibeagent.dude/agent');
+    try {
+      final hasPermission = await channel.invokeMethod<bool>('checkOverlayPermission');
+      setState(() {
+        _hasOverlayPermission = hasPermission ?? false;
+      });
+    } catch (e) {
+      debugPrint('Error checking overlay permission: $e');
+    }
+  }
+
+  Future<void> _requestOverlayPermission() async {
+    const channel = MethodChannel('com.vibeagent.dude/agent');
+    try {
+      await channel.invokeMethod('requestOverlayPermission');
+      // Recheck when coming back? For now just manual recheck
+    } catch (e) {
+      _setStatus('Error requesting permission: $e', Colors.red);
+    }
   }
 
   Future<void> _initializeStorage() async {
@@ -62,9 +92,9 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
       final config = await _secureStorage.getApiConfiguration();
       if (config != null) {
         if (config.apiKey.isNotEmpty) {
-          _apiKeyController.text = config.apiKey;
+           _apiKeyController.text = config.apiKey;
         }
-        
+
         if (config.modelId.isNotEmpty) {
            if (_commonModels.contains(config.modelId)) {
              _selectedModel = config.modelId;
@@ -76,6 +106,10 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
            }
         }
       }
+      
+      // Load automation settings
+      _automationMode = await _secureStorage.getAutomationMode();
+      _a11yOverlayEnabled = await _secureStorage.isA11yOverlayEnabled();
     } catch (e) {
       _setStatus('Error loading configuration: $e', Colors.red);
     } finally {
@@ -119,6 +153,10 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
         apiKey: _apiKeyController.text.trim(),
         serviceAccountJson: null,
       );
+
+      // Save automation settings
+      await _secureStorage.saveAutomationMode(_automationMode);
+      await _secureStorage.saveA11yOverlayEnabled(_a11yOverlayEnabled);
       
       // Update client immediately
       _geminiClient.updateConfiguration(_apiKeyController.text.trim(), modelId);
@@ -480,6 +518,80 @@ class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
                         ),
                       ),
                     ],
+                    
+                    SizedBox(height: isTablet ? 32 : 24),
+                    
+                    // Automation Settings Section
+                    Text(
+                      'Automation Settings',
+                      style: TextStyle(
+                        fontSize: isTablet ? 18 : 16,
+                        fontWeight: FontWeight.w600,
+                        color: const Color(0xFF2E7D32),
+                      ),
+                    ),
+                    SizedBox(height: isTablet ? 12 : 8),
+                    
+                    // Automation Mode Dropdown
+                    DropdownButtonFormField<String>(
+                      value: _automationMode,
+                      decoration: InputDecoration(
+                        labelText: 'Automation Mode',
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: const BorderSide(color: Color(0xFFE0E0E0)),
+                        ),
+                        contentPadding: EdgeInsets.symmetric(
+                          horizontal: isTablet ? 20 : 16,
+                          vertical: isTablet ? 20 : 16,
+                        ),
+                      ),
+                      items: const [
+                        DropdownMenuItem(
+                          value: 'vision_a11y',
+                          child: Text('Vision + Accessibility (Recommended)'),
+                        ),
+                        DropdownMenuItem(
+                          value: 'a11y_only',
+                          child: Text('Accessibility Only (Faster, No Vision)'),
+                        ),
+                      ],
+                      onChanged: (value) {
+                         if (value != null) {
+                           setState(() => _automationMode = value);
+                         }
+                      },
+                    ),
+                    SizedBox(height: isTablet ? 16 : 12),
+                    
+                    // A11y Overlay Toggle
+                    Container(
+                      decoration: BoxDecoration(
+                        border: Border.all(color: const Color(0xFFE0E0E0)),
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: SwitchListTile(
+                        title: const Text('Show Accessibility Overlay'),
+                        subtitle: Text(
+                          _hasOverlayPermission 
+                              ? 'Draw boxes over detected elements' 
+                              : 'Requires "Display over other apps" permission',
+                          style: TextStyle(
+                            fontSize: 12, 
+                            color: _hasOverlayPermission ? null : Colors.orange,
+                          ),
+                        ),
+                        value: _a11yOverlayEnabled,
+                        onChanged: (value) {
+                          if (value && !_hasOverlayPermission) {
+                            // Show dialog or just request permission
+                            _requestOverlayPermission();
+                          }
+                          setState(() => _a11yOverlayEnabled = value);
+                        },
+                        activeColor: const Color(0xFF4CAF50),
+                      ),
+                    ),
 
                     SizedBox(height: isTablet ? 40 : 32),
 

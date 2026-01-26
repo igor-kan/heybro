@@ -57,6 +57,25 @@ class MainActivity : FlutterActivity() {
     private var voiceAgentCoordinator: VoiceAgentCoordinator? = null
     private var voiceCommandReceiver: BroadcastReceiver? = null
     private var audioConsentManager: AudioConsentManager? = null
+
+    // A11y Overlay Service
+    private var a11yOverlayService: A11yOverlayService? = null
+    private var isA11yOverlayBound = false
+
+    private val a11yOverlayConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            val binder = service as A11yOverlayService.LocalBinder
+            a11yOverlayService = binder.getService()
+            isA11yOverlayBound = true
+            Log.d(TAG, "A11yOverlayService connected")
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            a11yOverlayService = null
+            isA11yOverlayBound = false
+            Log.d(TAG, "A11yOverlayService disconnected")
+        }
+    }
     
     private val appServiceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -176,6 +195,20 @@ class MainActivity : FlutterActivity() {
         } else {
             // Initialize voice features only if permissions are granted
             initializeVoiceFeatures()
+        }
+
+        // Start and bind A11yOverlayService
+        startA11yOverlayService()
+    }
+    
+    private fun startA11yOverlayService() {
+        try {
+            val serviceIntent = Intent(this, A11yOverlayService::class.java)
+            startService(serviceIntent)
+            bindService(serviceIntent, a11yOverlayConnection, Context.BIND_AUTO_CREATE)
+            Log.d(TAG, "A11yOverlayService started and binding initiated")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start A11yOverlayService", e)
         }
     }
     
@@ -441,6 +474,44 @@ class MainActivity : FlutterActivity() {
                     } catch (e: Exception) {
                         Log.e(TAG, "❌ Error getting consent info: ${e.message}", e)
                         result.error("CONSENT_ERROR", e.message, null)
+                    }
+                }
+                "getConsentInfo" -> {
+                    try {
+                        val consentInfo = accessibilityConsentManager.getConsentInfo()
+                        Log.d(TAG, "📋 Consent info retrieved: $consentInfo")
+                        result.success(consentInfo)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "❌ Error getting consent info: ${e.message}", e)
+                        result.error("CONSENT_ERROR", e.message, null)
+                    }
+                }
+                "updateA11yOverlay" -> {
+                    try {
+                        val elements = call.argument<List<Map<String, Any>>>("elements")
+                        Log.d(TAG, "🎨 updateA11yOverlay called with ${elements?.size} elements. Bound: $isA11yOverlayBound")
+                        if (elements != null && isA11yOverlayBound) {
+                            a11yOverlayService?.updateElements(elements)
+                            result.success(true)
+                        } else {
+                            result.error("SERVICE_ERROR", "Overlay service not bound or elements null", null)
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to update overlay", e)
+                        result.error("OVERLAY_ERROR", e.message, null)
+                    }
+                }
+                "clearA11yOverlay" -> {
+                    try {
+                        if (isA11yOverlayBound) {
+                            a11yOverlayService?.clearOverlay()
+                            result.success(true)
+                        } else {
+                            result.error("SERVICE_ERROR", "Overlay service not bound", null)
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to clear overlay", e)
+                        result.error("OVERLAY_ERROR", e.message, null)
                     }
                 }
                 "checkAudioPermissions" -> {

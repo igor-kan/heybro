@@ -6,6 +6,7 @@ class Task {
   final List<ChatMessage> messages;
   final TaskStatus status;
   final bool automationStarted;
+  final List<TaskLog> logs;
 
   Task({
     required this.id,
@@ -15,6 +16,7 @@ class Task {
     required this.messages,
     this.status = TaskStatus.active,
     this.automationStarted = false,
+    this.logs = const [],
   });
 
   Task copyWith({
@@ -25,6 +27,7 @@ class Task {
     List<ChatMessage>? messages,
     TaskStatus? status,
     bool? automationStarted,
+    List<TaskLog>? logs,
   }) {
     return Task(
       id: id ?? this.id,
@@ -34,6 +37,7 @@ class Task {
       messages: messages ?? this.messages,
       status: status ?? this.status,
       automationStarted: automationStarted ?? this.automationStarted,
+      logs: logs ?? this.logs,
     );
   }
 
@@ -46,6 +50,7 @@ class Task {
       'messages': messages.map((m) => m.toJson()).toList(),
       'status': status.toString(),
       'automationStarted': automationStarted,
+      'logs': logs.map((l) => l.toJson()).toList(),
     };
   }
 
@@ -63,6 +68,9 @@ class Task {
         orElse: () => TaskStatus.active,
       ),
       automationStarted: json['automationStarted'] ?? false,
+      logs: (json['logs'] as List?)
+          ?.map((l) => TaskLog.fromJson(l))
+          .toList() ?? [],
     );
   }
 }
@@ -105,6 +113,34 @@ class ChatMessage {
       isSystem: json['isSystem'] ?? false,
       timestamp: DateTime.parse(json['timestamp']),
       jsonData: json['jsonData'],
+    );
+  }
+}
+
+class TaskLog {
+  final String type; // 'prompt', 'response', 'info', etc.
+  final String content;
+  final DateTime timestamp;
+
+  TaskLog({
+    required this.type,
+    required this.content,
+    DateTime? timestamp,
+  }) : timestamp = timestamp ?? DateTime.now();
+
+  Map<String, dynamic> toJson() {
+    return {
+      'type': type,
+      'content': content,
+      'timestamp': timestamp.toIso8601String(),
+    };
+  }
+
+  factory TaskLog.fromJson(Map<String, dynamic> json) {
+    return TaskLog(
+      type: json['type'],
+      content: json['content'],
+      timestamp: DateTime.parse(json['timestamp']),
     );
   }
 }

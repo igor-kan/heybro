@@ -108,6 +108,17 @@ class TaskService {
     return _tasks.where((task) => task.status == status).toList();
   }
 
+  Future<void> addLogToTask(String taskId, TaskLog log) async {
+    final task = getTask(taskId);
+    if (task != null) {
+      final updatedLogs = List<TaskLog>.from(task.logs);
+      updatedLogs.add(log);
+      
+      final updatedTask = task.copyWith(logs: updatedLogs);
+      await updateTask(updatedTask);
+    }
+  }
+
   List<Task> searchTasks(String query) {
     final lowercaseQuery = query.toLowerCase();
     return _tasks.where((task) {

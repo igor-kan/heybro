@@ -1608,6 +1608,54 @@ class MyAccessibilityService : AccessibilityService() {
         }
     }
 
+    fun performCopy(): Boolean {
+        return try {
+            val node = getCurrentFocusedInput()
+            if (node != null) {
+                val result = node.performAction(AccessibilityNodeInfo.ACTION_COPY)
+                Log.d(TAG, "📋 Perform Copy: $result")
+                return result
+            }
+            Log.w(TAG, "❌ No focused input found for Copy")
+            false
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error performing copy: ${e.message}")
+            false
+        }
+    }
+
+    fun performPaste(): Boolean {
+        return try {
+            val node = getCurrentFocusedInput()
+            if (node != null) {
+                val result = node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+                Log.d(TAG, "📋 Perform Paste: $result")
+                return result
+            }
+            Log.w(TAG, "❌ No focused input found for Paste")
+            false
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error performing paste: ${e.message}")
+            false
+        }
+    }
+
+    fun performCut(): Boolean {
+        return try {
+            val node = getCurrentFocusedInput()
+            if (node != null) {
+                val result = node.performAction(AccessibilityNodeInfo.ACTION_CUT)
+                Log.d(TAG, "✂️ Perform Cut: $result")
+                return result
+            }
+            Log.w(TAG, "❌ No focused input found for Cut")
+            false
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error performing cut: ${e.message}")
+            false
+        }
+    }
+
     private fun findNodeWithText(
             node: AccessibilityNodeInfo,
             targetText: String

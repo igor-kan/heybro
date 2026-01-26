@@ -65,7 +65,7 @@ class _PermissionScreenState extends State<PermissionScreen>
       _hasAccessibilityPermission = await _checkAccessibilityPermission();
 
       // Check overlay permission
-      _hasOverlayPermission = await Permission.systemAlertWindow.isGranted;
+      _hasOverlayPermission = await _checkOverlayPermission();
 
       // Check audio permission
       _hasAudioPermission = await _checkAudioPermission();
@@ -104,6 +104,17 @@ class _PermissionScreenState extends State<PermissionScreen>
       return hasPermission;
     } catch (e) {
       debugPrint('Error checking accessibility permission: $e');
+      return false;
+    }
+  }
+
+  Future<bool> _checkOverlayPermission() async {
+    try {
+      const platform = MethodChannel('com.vibeagent.dude/agent');
+      final hasPermission = await platform.invokeMethod<bool>('checkOverlayPermission');
+      return hasPermission ?? false;
+    } catch (e) {
+      debugPrint('Error checking overlay permission: $e');
       return false;
     }
   }
