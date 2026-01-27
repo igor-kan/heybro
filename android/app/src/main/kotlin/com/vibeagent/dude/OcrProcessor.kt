@@ -52,12 +52,37 @@ class OcrProcessor {
                     // Extract elements (words) within this line
                     val elements = mutableListOf<Map<String, Any>>()
                     
-                    for (element in line.elements) {
-                        elements.add(mapOf(
+                    for (elementIndex in line.elements.indices) {
+                        val element = line.elements[elementIndex]
+                        val bounds = element.boundingBox
+                        
+                        // Calculate spatial context
+                        val position = calculateSpatialPosition(
+                            bounds, 
+                            bitmap.width, 
+                            bitmap.height
+                        )
+                        
+                        // Get surrounding context (previous and next words in the line)
+                        val previousWord = if (elementIndex > 0) {
+                            line.elements[elementIndex - 1].text
+                        } else null
+                        
+                        val nextWord = if (elementIndex < line.elements.size - 1) {
+                            line.elements[elementIndex + 1].text
+                        } else null
+                        
+                        
+                        elements.add(mapOf<String, Any>(
                             "text" to element.text,
                             "boundingBox" to mapBounds(element.boundingBox),
                             "cornerPoints" to mapCornerPoints(element.cornerPoints),
-                            "confidence" to (element.confidence ?: 0f)
+                            "confidence" to (element.confidence ?: 0f),
+                            // Add spatial context
+                            "position" to position,
+                            "previousWord" to (previousWord ?: ""),
+                            "nextWord" to (nextWord ?: ""),
+                            "lineText" to line.text  // Full line for better context
                         ))
                         totalElements++
                     }
@@ -115,7 +140,66 @@ class OcrProcessor {
         if (points == null) return emptyList()
         return points.map { mapOf("x" to it.x, "y" to it.y) }
     }
-
+    
+    /**
+     * Calculate spatial position information for a text element
+     * @param rect Bounding box of the text element
+     * @param screenWidth Total screen width
+     * @param screenHeight Total screen height
+     * @return Map with position information
+     */
+    private fun calculateSpatialPosition(rect: Rect?, screenWidth: Int, screenHeight: Int): Map<String, Any> {
+        if (rect == null) return emptyMap()
+        
+        val centerX = rect.centerX()
+        val centerY = rect.centerY()
+        
+        // Calculate quadrant (1-4, like a coordinate plane)
+        // 1: top-right, 2: top-left, 3: bottom-left, 4: bottom-right
+        val quadrant = when {
+            centerY < screenHeight / 2 && centerX >= screenWidth / 2 -> 1
+            centerY < screenHeight / 2 && centerX < screenWidth / 2 -> 2
+            centerY >= screenHeight / 2 && centerX < screenWidth / 2 -> 3
+            else -> 4
+        }
+        
+        // Calculate vertical position descriptor
+        val verticalPosition = when {
+            centerY < screenHeight / 3 -> "top"
+            centerY < (screenHeight * 2 / 3) -> "middle"
+            else -> "bottom"
+        }
+        
+        // Calculate horizontal position descriptor
+        val horizontalPosition = when {
+            centerX < screenWidth / 3 -> "left"
+            centerX < (screenWidth * 2 / 3) -> "center"
+            else -> "right"
+        }
+        
+        // Calculate normalized position (0.0 to 1.0)
+        val normalizedX = centerX.toFloat() / screenWidth
+        val normalizedY = centerY.toFloat() / screenHeight
+        
+        // Distance from screen center (useful for prioritizing central elements)
+        val screenCenterX = screenWidth / 2f
+        val screenCenterY = screenHeight / 2f
+        val distanceFromCenter = kotlin.math.sqrt(
+            ((centerX - screenCenterX) * (centerX - screenCenterX) + 
+             (centerY - screenCenterY) * (centerY - screenCenterY)).toFloat()
+        )
+        
+        return mapOf(
+            "quadrant" to quadrant,
+            "vertical" to verticalPosition,
+            "horizontal" to horizontalPosition,
+            "normalizedX" to normalizedX,
+            "normalizedY" to normalizedY,
+            "distanceFromCenter" to distanceFromCenter,
+            "description" to "$verticalPosition-$horizontalPosition"  // e.g., "top-left"
+        )
+    }
+    
     private fun decodeBase64ToBitmap(base64Str: String): Bitmap? {
         return try {
             val decoded = Base64.decode(base64Str, Base64.NO_WRAP)

@@ -55,8 +55,6 @@ class ToolsManager {
           return await _performLongPress(parameters);
         case 'perform_double_click':
           return await _performDoubleClick(parameters);
-        case 'perform_grouped_taps':
-          return await _performGroupedTaps(parameters);
 
         // Precise Element Tapping
         case 'tap_element_by_text':
@@ -87,7 +85,7 @@ class ToolsManager {
         case 'non_tap_text_input':
           return await _nonTapTextInput(parameters);
         case 'get_focused_input_info':
-          return await _getFocusedInputInfo();
+           return await _getFocusedInputInfo();
         case 'get_all_input_fields':
           return await _getAllInputFields();
 
@@ -99,12 +97,16 @@ class ToolsManager {
           return await _copyText();
         case 'paste_text':
           return await _pasteText();
+        case 'robust_text_input':
+          return await _robustTextInput(parameters);
         case 'replace_text':
           return await _replaceText(parameters);
         case 'type_text_slowly':
           return await _typeTextSlowly(parameters);
         case 'insert_text':
           return await _insertText(parameters);
+        case 'set_clipboard_text':
+          return await _setClipboardText(parameters);
 
 
 
@@ -396,35 +398,7 @@ class ToolsManager {
     }
   }
 
-  static Future<Map<String, dynamic>> _performGroupedTaps(
-      Map<String, dynamic> parameters) async {
-    try {
-      final taps = parameters['taps'];
-      if (taps is! List) {
-        return {
-          'success': false, 
-          'error': 'Missing taps list parameter',
-          'data': null
-        };
-      }
 
-      final result = await _toolsChannel.invokeMethod('performGroupedTaps', {
-        'taps': taps,
-      });
-
-      return {
-        'success': result == true,
-        'data': null,
-        'error': result == true ? null : 'Grouped taps failed'
-      };
-    } catch (e) {
-      return {
-        'success': false,
-        'error': 'Failed to perform grouped taps: $e',
-        'data': null
-      };
-    }
-  }
 
   // ==================== GESTURE OPERATIONS ====================
 
@@ -742,6 +716,55 @@ class ToolsManager {
     }
   }
 
+  static Future<Map<String, dynamic>> _setClipboardText(
+      Map<String, dynamic> parameters) async {
+    try {
+      final text = parameters['text'] ?? '';
+      final result = await _toolsChannel.invokeMethod('setClipboardText', {
+        'text': text,
+      });
+
+      return {
+        'success': result == true,
+        'data': null,
+        'error': result == true ? null : 'Set clipboard text failed'
+      };
+    } catch (e) {
+      return {
+        'success': false,
+        'error': 'Failed to set clipboard text: $e',
+        'data': null
+      };
+    }
+  }
+
+  static Future<Map<String, dynamic>> _robustTextInput(
+      Map<String, dynamic> parameters) async {
+    try {
+      final text = parameters['text'] ?? '';
+      final targetBounds = parameters['targetBounds']; // Optional bounds hint for vision mode
+      final maxRetries = parameters['maxRetries'] ?? 3;
+
+      final result = await _toolsChannel.invokeMethod('robustTextInput', {
+        'text': text,
+        'targetBounds': targetBounds,
+        'maxRetries': maxRetries,
+      });
+
+      return {
+        'success': result == true,
+        'data': null,
+        'error': result == true ? null : 'Robust text input failed'
+      };
+    } catch (e) {
+      return {
+        'success': false,
+        'error': 'Failed to perform robust text input: $e',
+        'data': null
+      };
+    }
+  }
+
   static Future<Map<String, dynamic>> _cutText() async {
     try {
       final result = await _toolsChannel.invokeMethod('cutText');
@@ -836,45 +859,14 @@ class ToolsManager {
       Map<String, dynamic> parameters) async {
     try {
       final text = parameters['text'] ?? '';
-      final clearFirst = parameters['clearFirst'] ?? false;
-      final delayMs = parameters['delayMs']?.toInt() ?? 0;
-
-      final result = await _toolsChannel.invokeMethod('advancedTypeText', {
-        'text': text,
-        'clearFirst': clearFirst,
-        'delayMs': delayMs,
-      });
-
-      // If text input was successful, perform Enter for multi-field forms with proper timing
-      if (result == true) {
-        try {
-          // Small delay to ensure text is properly set in the field
-          await Future.delayed(Duration(milliseconds: 200));
-          
-          // Get all input fields to check if there are multiple fields on screen
-          final inputFieldsResult = await _getAllInputFields();
-          if (inputFieldsResult['success'] == true && inputFieldsResult['data'] != null) {
-            final inputFields = inputFieldsResult['data'] as List;
-            
-            // If there are multiple input fields, perform Enter
-            if (inputFields.length > 1) {
-              await _performEnter();
-            }
-          }
-        } catch (e) {
-          // Ignore errors in auto-enter functionality, don't affect main operation
-        }
-      }
-
-      return {
-        'success': result == true,
-        'data': null,
-        'error': result == true ? null : 'Advanced type text failed'
-      };
+      
+      // Use robust_text_input which handles IME + fallback automatically
+      return await _robustTextInput({'text': text, 'maxRetries': 3});
+      
     } catch (e) {
       return {
         'success': false,
-        'error': 'Failed to advanced type text: $e',
+        'error': 'Failed to type text: $e',
         'data': null
       };
     }
@@ -1366,7 +1358,7 @@ class ToolsManager {
       'perform_tap',
       'perform_long_press',
       'perform_double_click',
-      'perform_grouped_taps',
+
       'tap_element_by_text',
       'tap_element_by_index',
       'tap_element_by_bounds',
@@ -1383,6 +1375,7 @@ class ToolsManager {
       'perform_advanced_type',
       'advanced_type_text',
       'type_text',
+      'robust_text_input',  // IME-based direct text injection
       'non_tap_text_input',
       'get_focused_input_info',
 
@@ -1390,6 +1383,7 @@ class ToolsManager {
       'select_all_text',
       'copy_text',
       'paste_text',
+      'set_clipboard_text',
       'replace_text',
       'type_text_slowly',
       'insert_text',
@@ -1451,7 +1445,7 @@ class ToolsManager {
          'tap_ocr_text',
          'tap_ocr_bounds',
          'perform_double_click',
-         'perform_grouped_taps',
+
         'perform_swipe',
         'perform_scroll',
         'perform_dynamic_scroll',
@@ -1469,6 +1463,7 @@ class ToolsManager {
         'select_all_text',
         'copy_text',
         'paste_text',
+        'set_clipboard_text',
         'replace_text',
         'type_text_slowly',
         'insert_text',
@@ -1541,7 +1536,7 @@ class ToolsManager {
        'tap_ocr_text': 'Tap using OCR-matched text block {"text": "..."}',
        'tap_ocr_bounds': 'Tap using explicit OCR bounds {"left","top","right","bottom"}',
       'perform_double_click': 'Double tap at specific coordinates',
-      'perform_grouped_taps': 'Perform multiple taps in sequence (e.g. for typing)',
+
 
       // Gestures
       'perform_swipe': 'Swipe from start coordinates to end coordinates',

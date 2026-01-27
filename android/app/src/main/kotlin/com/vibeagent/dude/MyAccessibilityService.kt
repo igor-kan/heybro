@@ -17,6 +17,8 @@ import android.view.accessibility.AccessibilityNodeInfo
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import android.content.ClipboardManager
+import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
@@ -365,46 +367,50 @@ class MyAccessibilityService : AccessibilityService() {
         }
     }
 
-    fun performTap(x: Float, y: Float): Boolean {
+    fun performTap(x: Float, y: Float, blindTap: Boolean = false): Boolean {
         return try {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
                 return false
             }
 
-            Log.d(TAG, "🎯 Attempting tap at coordinates: ($x, $y)")
+            Log.d(TAG, "🎯 Attempting tap at coordinates: ($x, $y)${if (blindTap) " [BLIND TAP MODE]" else ""}")
             
-            val rootNode = rootInActiveWindow
-            if (rootNode != null) {
-                // Precision Upgrade: Always try to find a target node first
-                val targetNode = findNodeAtCoordinates(rootNode, x, y)
-                if (targetNode != null) {
-                    // If the node itself is clickable, click it directly
-                    if (targetNode.isClickable) {
-                        Log.d(TAG, "🎯 Found clickable node at ($x, $y) - performing direct click")
-                        val success = performNodeBasedClick(targetNode)
-                        targetNode.recycle()
-                        rootNode.recycle()
-                        return success
-                    }
-                    
-                    // If node is not clickable, check if it has a clickable parent
-                    val clickableParent = findClickableParent(targetNode)
-                    if (clickableParent != null) {
-                         Log.d(TAG, "🎯 Found clickable parent for node at ($x, $y) - performing direct click")
-                         val success = performNodeBasedClick(clickableParent)
-                         clickableParent.recycle()
-                         targetNode.recycle()
-                         rootNode.recycle()
-                         return success
-                    }
+            // **Vision Mode Blind Tap**: Skip all node searching and tap directly at coordinates
+            // This prevents tapping wrong elements in different windows/layers
+            if (!blindTap) {
+                val rootNode = rootInActiveWindow
+                if (rootNode != null) {
+                    // Precision Upgrade: Always try to find a target node first
+                    val targetNode = findNodeAtCoordinates(rootNode, x, y)
+                    if (targetNode != null) {
+                        // If the node itself is clickable, click it directly
+                        if (targetNode.isClickable) {
+                            Log.d(TAG, "🎯 Found clickable node at ($x, $y) - performing direct click")
+                            val success = performNodeBasedClick(targetNode)
+                            targetNode.recycle()
+                            rootNode.recycle()
+                            return success
+                        }
+                        
+                        // If node is not clickable, check if it has a clickable parent
+                        val clickableParent = findClickableParent(targetNode)
+                        if (clickableParent != null) {
+                             Log.d(TAG, "🎯 Found clickable parent for node at ($x, $y) - performing direct click")
+                             val success = performNodeBasedClick(clickableParent)
+                             clickableParent.recycle()
+                             targetNode.recycle()
+                             rootNode.recycle()
+                             return success
+                        }
 
-                    targetNode.recycle()
+                        targetNode.recycle()
+                    }
+                    rootNode.recycle()
                 }
-                rootNode.recycle()
             }
             
-            // Fallback to coordinate-based tap if no clickable node found
-            Log.d(TAG, "🖱️ No clickable node found - using coordinate-based tap")
+            // Blind tap mode OR fallback to coordinate-based tap if no clickable node found
+            Log.d(TAG, if (blindTap) "👆 Blind tap - pure coordinate-based gesture" else "🖱️ No clickable node found - using coordinate-based tap")
             val path = Path()
             path.moveTo(x, y)
 
@@ -1624,22 +1630,6 @@ class MyAccessibilityService : AccessibilityService() {
         }
     }
 
-    fun performPaste(): Boolean {
-        return try {
-            val node = getCurrentFocusedInput()
-            if (node != null) {
-                val result = node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
-                Log.d(TAG, "📋 Perform Paste: $result")
-                return result
-            }
-            Log.w(TAG, "❌ No focused input found for Paste")
-            false
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Error performing paste: ${e.message}")
-            false
-        }
-    }
-
     fun performCut(): Boolean {
         return try {
             val node = getCurrentFocusedInput()
@@ -1654,6 +1644,421 @@ class MyAccessibilityService : AccessibilityService() {
             Log.e(TAG, "❌ Error performing cut: ${e.message}")
             false
         }
+    }
+
+    fun setClipboardText(text: String): Boolean {
+        return try {
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clip = ClipData.newPlainText("Automated Text", text)
+            clipboard.setPrimaryClip(clip)
+            Log.d(TAG, "📋 Clipboard set to: '$text'")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error setting clipboard: ${e.message}")
+            false
+        }
+    }
+    
+    /**
+     * Paste text from clipboard into the currently focused input field
+     * @return Boolean indicating success/failure
+     */
+    fun performPaste(): Boolean {
+        return try {
+            Log.d(TAG, "🔧 Attempting to paste from clipboard")
+            
+            val rootNode = rootInActiveWindow
+            if (rootNode == null) {
+                Log.e(TAG, "❌ No root node available for paste")
+                return false
+            }
+            
+            // Try to find focused input field
+            val focusedNode = rootNode.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+            if (focusedNode != null) {
+                Log.d(TAG, "Found focused input field")
+                val success = focusedNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+                focusedNode.recycle()
+                rootNode.recycle()
+                
+                if (success) {
+                    Log.d(TAG, "✅ Paste successful")
+                } else {
+                    Log.w(TAG, "⚠️ Paste action returned false")
+                }
+                return success
+            }
+            
+            // Fallback: try to find any editable field
+            val editableNode = findFirstEditableNode(rootNode)
+            if (editableNode != null) {
+                Log.d(TAG, "No focused field, found editable field as fallback")
+                
+                // Try to focus it first
+                editableNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                
+                // Then paste
+                val success = editableNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+                editableNode.recycle()
+                rootNode.recycle()
+                
+                if (success) {
+                    Log.d(TAG, "✅ Paste successful (fallback)")
+                } else {
+                    Log.w(TAG, "⚠️ Paste action returned false (fallback)")
+                }
+                return success
+            }
+            
+            rootNode.recycle()
+            Log.e(TAG, "❌ No input field found for pasting")
+            false
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error performing paste: ${e.message}", e)
+            false
+        }
+    }
+
+    /**
+     * Robust text input using IME (Input Method Editor) service for direct text injection
+     * This replaces the fragile clipboard/paste approach with direct InputConnection.commitText()
+     * 
+     * Benefits of IME approach:
+     * - No clipboard pollution
+     * - No focus validation needed (IME handles it)
+     * - Direct text injection via InputConnection
+     * - Most reliable method for text input
+     * 
+     * @param text The text to input
+     * @param targetBounds Optional bounds hint for the input field location (for vision mode tap-to-focus fallback)
+     * @param maxRetries Maximum number of retry attempts
+     * @return Boolean indicating success/failure with detailed logging
+     */
+    fun performRobustTextInput(
+        text: String,
+        targetBounds: Rect? = null,
+        maxRetries: Int = 3
+    ): Boolean {
+        Log.d(TAG, "🎯 Robust Text Input (IME) START: text='${text.take(30)}${if (text.length > 30) "..." else ""}'")
+        
+        // **PRIMARY STRATEGY**: Use IME for direct text injection
+        if (AutomationIME.isAvailable()) {
+            Log.d(TAG, "✅ AutomationIME is available, using direct text injection")
+            
+            for (attempt in 1..maxRetries) {
+                Log.d(TAG, "📍 IME Attempt $attempt/$maxRetries")
+                
+                try {
+                    // Direct text injection via IME - bypasses all clipboard/focus issues
+                    val success = AutomationIME.injectText(text)
+                    
+                    if (success) {
+                        Log.d(TAG, "✅ ROBUST TEXT INPUT SUCCESS via IME on attempt $attempt")
+                        return true
+                    } else {
+                        Log.w(TAG, "⚠️ IME injection returned false on attempt $attempt")
+                        if (attempt < maxRetries) {
+                            Thread.sleep(200L * attempt) // Exponential backoff
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "❌ IME injection error on attempt $attempt: ${e.message}", e)
+                    if (attempt < maxRetries) {
+                        Thread.sleep(200L * attempt)
+                        continue
+                    }
+                }
+            }
+            
+            Log.w(TAG, "⚠️ IME injection failed after $maxRetries attempts, falling back to clipboard method")
+        } else {
+            Log.w(TAG, "⚠️ AutomationIME not available, using fallback clipboard method")
+        }
+        
+        // **FALLBACK STRATEGY**: Ultra-robust clipboard + paste
+        Log.d(TAG, "🔄 Falling back to clipboard+paste method")
+        
+        for (attempt in 1..maxRetries) {
+            Log.d(TAG, "📍 Fallback Attempt $attempt/$maxRetries")
+            
+            try {
+                // Step 1: Set clipboard
+                val clipboardSet = setClipboardText(text)
+                if (!clipboardSet) {
+                    Log.e(TAG, "❌ Failed to set clipboard on attempt $attempt")
+                    if (attempt < maxRetries) {
+                        Thread.sleep(200L * attempt)
+                        continue
+                    }
+                    return false
+                }
+                Log.d(TAG, "✅ Clipboard set successfully")
+                
+                Thread.sleep(150)
+                
+                // Step 2: Find and validate input field
+                val rootNode = rootInActiveWindow
+                if (rootNode == null) {
+                    Log.e(TAG, "❌ No root node on attempt $attempt")
+                    if (attempt < maxRetries) {
+                        Thread.sleep(200L * attempt)
+                        continue
+                    }
+                    return false
+                }
+                
+                // Find input field with multiple fallback strategies
+                var inputNode: AccessibilityNodeInfo? = null
+                var focusMethod = "unknown"
+                
+                // Try 1: Cached focused input
+                inputNode = currentFocusedInput
+                if (inputNode != null && !inputNode.refresh()) {
+                    Log.w(TAG, "⚠️ Cached focused input is stale")
+                    clearFocusCache()
+                    inputNode = null
+                }
+                if (inputNode != null) {
+                    focusMethod = "cached"
+                    Log.d(TAG, "✓ Using cached focused input")
+                }
+                
+                // Try 2: Currently focused input
+                if (inputNode == null) {
+                    inputNode = rootNode.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                    if (inputNode != null && isEditableNode(inputNode)) {
+                        focusMethod = "find_focus"
+                        Log.d(TAG, "✓ Found focused editable input")
+                    } else {
+                        inputNode?.recycle()
+                        inputNode = null
+                    }
+                }
+                
+                // Try 3: Target bounds (if provided)
+                if (inputNode == null && targetBounds != null) {
+                    inputNode = findEditableNodeByBounds(rootNode, targetBounds)
+                    if (inputNode != null) {
+                        focusMethod = "bounds_match"
+                        Log.d(TAG, "✓ Found input field at target bounds")
+                    }
+                }
+                
+                // Try 4: First editable node
+                if (inputNode == null) {
+                    inputNode = findFirstEditableNode(rootNode)
+                    if (inputNode != null) {
+                        focusMethod = "first_editable"
+                        Log.d(TAG, "⚠️ Fallback: using first editable field")
+                    }
+                }
+                
+                // **KEY FIX**: If still no input, forcefully tap an editable field to focus it
+                if (inputNode == null) {
+                    Log.w(TAG, "⚠️ No focused input field found, attempting to TAP an editable field...")
+                    val editableNode = findFirstEditableNode(rootNode)
+                    
+                    if (editableNode != null) {
+                        val bounds = Rect()
+                        editableNode.getBoundsInScreen(bounds)
+                        Log.d(TAG, "📍 Found editable at bounds: $bounds")
+                        
+                        // Tap center of the field
+                        val centerX = bounds.centerX().toFloat()
+                        val centerY = bounds.centerY().toFloat()
+                        
+                        Log.d(TAG, "👆 Tapping editable field at ($centerX, $centerY)")
+                        val tapSuccess = performTap(centerX, centerY, blindTap = true)
+                        
+                        if (tapSuccess) {
+                            Thread.sleep(300) // Wait for field to focus and keyboard to appear
+                            
+                            // Re-fetch the now-focused input
+                            val newRoot = rootInActiveWindow
+                            if (newRoot != null) {
+                                inputNode = newRoot.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                                if (inputNode != null && isEditableNode(inputNode)) {
+                                    focusMethod = "tap_to_focus"
+                                    Log.d(TAG, "✅ Successfully focused input via tap")
+                                } else {
+                                    // Try using the tapped node itself
+                                    if (editableNode.refresh() && isEditableNode(editableNode)) {
+                                        inputNode = editableNode
+                                        focusMethod = "tapped_node"
+                                        Log.d(TAG, "✅ Using tapped node directly")
+                                    }
+                                }
+                                newRoot.recycle()
+                            }
+                        }
+                        
+                        if (inputNode == null) {
+                            editableNode.recycle()
+                        }
+                    }
+                }
+                
+                if (inputNode == null) {
+                    Log.e(TAG, "❌ No input field found even after tapping, attempt $attempt")
+                    rootNode.recycle()
+                    if (attempt < maxRetries) {
+                        Thread.sleep(500L * attempt)
+                        continue
+                    }
+                    return false
+                }
+                
+                Log.d(TAG, "📝 Input field found via: $focusMethod")
+                
+                // Step 3: Ensure focus
+                if (!inputNode.isFocused) {
+                    Log.d(TAG, "⚡ Attempting to focus field...")
+                    inputNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                    Thread.sleep(200)
+                }
+                
+                // Step 4: Try paste strategies
+                var pasteSuccess = false
+                
+                // Strategy 1: ACTION_PASTE
+                Log.d(TAG, "🔧 Strategy 1: ACTION_PASTE")
+                pasteSuccess = inputNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+                
+                if (!pasteSuccess && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    // Strategy 2: ACTION_SET_TEXT
+                    Log.d(TAG, "🔧 Strategy 2: ACTION_SET_TEXT")
+                    val arguments = Bundle()
+                    arguments.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+                    pasteSuccess = inputNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)
+                }
+                
+                if (!pasteSuccess) {
+                    // Strategy 3: Look for "Paste" button on keyboard/UI and tap it
+                    Log.d(TAG, "🔧 Strategy 3: Looking for Paste button in UI")
+                    val allRoot = rootInActiveWindow
+                    if (allRoot != null) {
+                        // Look for nodes with text "Paste", contentDescription "Paste", or resource ID containing "paste"
+                        val pasteNodes = allRoot.findAccessibilityNodeInfosByText("Paste")
+                        for (node in pasteNodes) {
+                            if (node.isClickable || node.isEnabled) {
+                                Log.d(TAG, "📍 Found clickable Paste element: ${node.text ?: node.contentDescription}")
+                                pasteSuccess = node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                                if (pasteSuccess) {
+                                    Log.d(TAG, "✅ Tapped Paste button successfully")
+                                    node.recycle()
+                                    break
+                                }
+                            }
+                            node.recycle()
+                        }
+                        allRoot.recycle()
+                    }
+                }
+                
+                // Strategy 4: Look for clipboard suggestion chip (often shown as the clipboard text itself)
+                if (!pasteSuccess) {
+                    Log.d(TAG, "🔧 Strategy 4: Looking for clipboard suggestion chip")
+                    val allRoot2 = rootInActiveWindow
+                    if (allRoot2 != null) {
+                        // Look for nodes containing the clipboard text
+                        val suggestionNodes = allRoot2.findAccessibilityNodeInfosByText(text.take(20)) // First 20 chars
+                        for (node in suggestionNodes) {
+                            // Check if it's a clickable suggestion (usually in keyboard area)
+                            if ((node.isClickable || node.isEnabled) && node.text?.toString()?.contains(text) == true) {
+                                Log.d(TAG, "📍 Found clipboard suggestion: ${node.text}")
+                                pasteSuccess = node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                                if (pasteSuccess) {
+                                    Log.d(TAG, "✅ Tapped clipboard suggestion successfully")
+                                    node.recycle()
+                                    break
+                                }
+                            }
+                            node.recycle()
+                        }
+                        allRoot2.recycle()
+                    }
+                }
+                
+                inputNode.recycle()
+                rootNode.recycle()
+                
+                if (pasteSuccess) {
+                    Log.d(TAG, "✅ ROBUST TEXT INPUT SUCCESS via fallback on attempt $attempt")
+                    return true
+                } else if (attempt < maxRetries) {
+                    Log.w(TAG, "⚠️ All strategies failed on attempt $attempt, retrying...")
+                    Thread.sleep(300L * attempt)
+                }
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Exception on attempt $attempt: ${e.message}", e)
+                if (attempt < maxRetries) {
+                    Thread.sleep(300L * attempt)
+                    continue
+                }
+            }
+        }
+        
+        Log.e(TAG, "❌ ROBUST TEXT INPUT FAILED after $maxRetries attempts (both IME and fallback)")
+        return false
+    }
+    
+    /**
+     * Find an editable node that matches the given bounds (for vision mode)
+     */
+    private fun findEditableNodeByBounds(
+        rootNode: AccessibilityNodeInfo,
+        targetBounds: Rect
+    ): AccessibilityNodeInfo? {
+        try {
+            return findEditableNodeByBoundsRecursive(rootNode, targetBounds)
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error finding node by bounds: ${e.message}")
+            return null
+        }
+    }
+    
+    private fun findEditableNodeByBoundsRecursive(
+        node: AccessibilityNodeInfo,
+        targetBounds: Rect
+    ): AccessibilityNodeInfo? {
+        try {
+            if (isEditableNode(node)) {
+                val bounds = Rect()
+                node.getBoundsInScreen(bounds)
+                
+                // Check if bounds overlap or are close (within 50px tolerance)
+                if (boundsOverlapWithTolerance(bounds, targetBounds, 50)) {
+                    return node
+                }
+            }
+            
+            // Search children
+            for (i in 0 until node.childCount) {
+                val child = node.getChild(i)
+                child?.let {
+                    val result = findEditableNodeByBoundsRecursive(it, targetBounds)
+                    if (result != null) {
+                        it.recycle()
+                        return result
+                    }
+                    it.recycle()
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error in bounds search: ${e.message}")
+        }
+        return null
+    }
+    
+    private fun boundsOverlapWithTolerance(bounds1: Rect, bounds2: Rect, tolerance: Int): Boolean {
+        val expandedBounds1 = Rect(
+            bounds1.left - tolerance,
+            bounds1.top - tolerance,
+            bounds1.right + tolerance,
+            bounds1.bottom + tolerance
+        )
+        return Rect.intersects(expandedBounds1, bounds2)
     }
 
     private fun findNodeWithText(

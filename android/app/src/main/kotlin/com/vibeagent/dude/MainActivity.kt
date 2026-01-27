@@ -602,6 +602,8 @@ class MainActivity : FlutterActivity() {
                             notifyVoiceServiceAutomationError(e.message ?: "Unknown error")
                         }
                     }
+                    // Notify IME about state change (Starting)
+                    sendAutomationStateBroadcast(true)
                 }
                 "isAutomating" -> {
                     val isRunning = automationService.isAutomating()
@@ -612,6 +614,8 @@ class MainActivity : FlutterActivity() {
                     automationService.stopAutomation()
                     result.success(true)
                     Log.d(TAG, "✅ Automation stopped")
+                    // Notify IME about state change (Stopped)
+                    sendAutomationStateBroadcast(false)
                 }
                 "startForegroundAutomation" -> {
                     val userTask = call.argument<String>("user_task") ?: ""
@@ -637,12 +641,20 @@ class MainActivity : FlutterActivity() {
                 "notifyAutomationComplete" -> {
                     Log.d(TAG, "Flutter notified automation completion")
                     notifyVoiceServiceAutomationComplete()
+                    sendAutomationStateBroadcast(false)
                     result.success(true)
                 }
                 "notifyAutomationError" -> {
                     val error = call.argument<String>("error") ?: "Unknown error"
                     Log.d(TAG, "Flutter notified automation error: $error")
                     notifyVoiceServiceAutomationError(error)
+                    sendAutomationStateBroadcast(false)
+                    result.success(true)
+                }
+                "notifyAutomationState" -> {
+                    val isAutomating = call.argument<Boolean>("isAutomating") ?: false
+                    Log.d(TAG, "Flutter notified automation state: $isAutomating")
+                    sendAutomationStateBroadcast(isAutomating)
                     result.success(true)
                 }
                 "getTaskHistory" -> {
@@ -796,6 +808,17 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    private fun sendAutomationStateBroadcast(isAutomating: Boolean) {
+        try {
+            val intent = Intent("com.vibeagent.dude.ACTION_AUTOMATION_STATE")
+            intent.putExtra("is_automating", isAutomating)
+            sendBroadcast(intent)
+            Log.d(TAG, "📡 Sent automation state broadcast: $isAutomating")
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Failed to send automation state broadcast", e)
+        }
+    }
+
     private fun handleToolCall(call: MethodCall, result: MethodChannel.Result) {
         Log.d(TAG, "🔧 Tool call: ${call.method}")
 
@@ -832,6 +855,9 @@ class MainActivity : FlutterActivity() {
                 "nonTapTextInput" -> handleNonTapTextInput(call, result)
                 "getFocusedInputInfo" -> handleGetFocusedInputInfo(result)
                 "getAllInputFields" -> handleGetAllInputFields(result)
+                "setClipboardText" -> handleSetClipboardText(call, result)
+                "pasteText" -> handlePasteText(result)
+                "robustTextInput" -> handleRobustTextInput(call, result)
                 // Removed text input methods
                 "typeTextSlowly" -> handleTypeTextSlowly(call, result)
                 "insertText" -> handleInsertText(call, result)
@@ -860,12 +886,19 @@ class MainActivity : FlutterActivity() {
                 "searchApps" -> handleSearchApps(call, result)
                 "getBestMatchingApp" -> handleGetBestMatchingApp(call, result)
 
+                // IME Operations
+                "checkIMEStatus" -> handleCheckIMEStatus(result)
+                "openIMESettings" -> handleOpenIMESettings(result)
+
                 // Navigation
                 "performHome" -> handlePerformHome(result)
                 "performRecents" -> handlePerformRecents(result)
                 "openSettings" -> handleOpenSettings(result)
                 "openNotifications" -> handleOpenNotifications(result)
                 "openQuickSettings" -> handleOpenQuickSettings(result)
+                
+                // Device info
+                "getScreenDimensions" -> handleGetScreenDimensions(result)
 
                 else -> {
                     Log.w(TAG, "⚠️ Unknown tool: ${call.method}")
@@ -1362,6 +1395,71 @@ class MainActivity : FlutterActivity() {
         } catch (e: Exception) {
             Log.e(TAG, "❌ Get all input fields error: ${e.message}", e)
             result.error("INPUT_FIELDS_ERROR", e.message, null)
+        }
+    }
+
+    private fun handleSetClipboardText(call: MethodCall, result: MethodChannel.Result) {
+        try {
+            val text = call.argument<String>("text") ?: ""
+            val service = MyAccessibilityService.instance
+            if (service != null) {
+                val success = service.setClipboardText(text)
+                result.success(success)
+                Log.d(TAG, if (success) "✅ Clipboard set to: '$text'" else "❌ Failed to set clipboard")
+            } else {
+                result.error("SERVICE_UNAVAILABLE", "Accessibility service not available", null)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Set clipboard error: ${e.message}", e)
+            result.error("CLIPBOARD_ERROR", e.message, null)
+        }
+    }
+
+    private fun handlePasteText(result: MethodChannel.Result) {
+        try {
+            val service = MyAccessibilityService.instance
+            if (service != null) {
+                val success = service.performPaste()
+                result.success(success)
+                Log.d(TAG, if (success) "✅ Paste performed" else "❌ Paste failed")
+            } else {
+                result.error("SERVICE_UNAVAILABLE", "Accessibility service not available", null)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Paste error: ${e.message}", e)
+            result.error("PASTE_ERROR", e.message, null)
+        }
+    }
+
+    private fun handleRobustTextInput(call: MethodCall, result: MethodChannel.Result) {
+        coroutineScope.launch {
+            try {
+                val text = call.argument<String>("text") ?: ""
+                val boundsMap = call.argument<Map<String, Any>>("targetBounds")
+                val maxRetries = call.argument<Int>("maxRetries") ?: 3
+                
+                // Convert bounds map to android.graphics.Rect if provided
+                val rect: android.graphics.Rect? = boundsMap?.let {
+                    android.graphics.Rect(
+                        (it["left"] as? Number)?.toInt() ?: 0,
+                        (it["top"] as? Number)?.toInt() ?: 0,
+                        (it["right"] as? Number)?.toInt() ?: 0,
+                        (it["bottom"] as? Number)?.toInt() ?: 0
+                    )
+                }
+                
+                val service = MyAccessibilityService.instance
+                if (service != null) {
+                    val success = service.performRobustTextInput(text, rect, maxRetries)
+                    result.success(success)
+                    Log.d(TAG, if (success) "✅ Robust text input succeeded" else "❌ Robust text input failed")
+                } else {
+                    result.error("SERVICE_UNAVAILABLE", "Accessibility service not available", null)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Robust text input error: ${e.message}", e)
+                result.error("ROBUST_TEXT_INPUT_ERROR", e.message, null)
+            }
         }
     }
 
@@ -1971,6 +2069,97 @@ class MainActivity : FlutterActivity() {
         intent.putExtra("result", resultJson)
         intent.setPackage(packageName)
         sendBroadcast(intent)
+    }
+    
+    // ==================== DEVICE INFO ====================
+    
+    private fun handleGetScreenDimensions(result: MethodChannel.Result) {
+        try {
+            val displayMetrics = resources.displayMetrics
+            val width = displayMetrics.widthPixels
+            val height = displayMetrics.heightPixels
+            
+            val dimensions = mapOf(
+                "width" to width,
+                "height" to height,
+                "density" to displayMetrics.density,
+                "densityDpi" to displayMetrics.densityDpi
+            )
+            
+            result.success(dimensions)
+            Log.d(TAG, "✅ Screen dimensions: ${width}x${height} (density=${displayMetrics.density})")
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Error getting screen dimensions: ${e.message}", e)
+            result.error("SCREEN_DIM_ERROR", e.message, null)
+        }
+    }
+    
+    // ==================== IME OPERATIONS ====================
+    
+    private fun handleCheckIMEStatus(result: MethodChannel.Result) {
+        try {
+            val imeAvailable = AutomationIME.isAvailable()
+            val imeEnabled = isAutomationIMEEnabled()
+            val imeDefault = isAutomationIMEDefault()
+            
+            val status = mapOf(
+                "available" to imeAvailable,
+                "enabled" to imeEnabled,
+                "isDefault" to imeDefault,
+                "message" to when {
+                    imeAvailable -> "AutomationIME is active and ready"
+                    imeEnabled -> "AutomationIME is enabled but not active (switch keyboards or restart app)"
+                    else -> "AutomationIME is not enabled. Please enable in Settings."
+                }
+            )
+            
+            result.success(status)
+            Log.d(TAG, "✅ IME Status: available=$imeAvailable, enabled=$imeEnabled, default=$imeDefault")
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Check IME status error: ${e.message}", e)
+            result.error("IME_STATUS_ERROR", e.message, null)
+        }
+    }
+    
+    private fun handleOpenIMESettings(result: MethodChannel.Result) {
+        try {
+            val intent = Intent(android.provider.Settings.ACTION_INPUT_METHOD_SETTINGS)
+            intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            startActivity(intent)
+            result.success(true)
+            Log.d(TAG, "✅ Opened IME settings")
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ Open IME settings error: ${e.message}", e)
+            result.error("IME_SETTINGS_ERROR", e.message, null)
+        }
+    }
+    
+    private fun isAutomationIMEEnabled(): Boolean {
+        return try {
+            val imeId = "$packageName/.AutomationIME"
+            val enabledIMEs = android.provider.Settings.Secure.getString(
+                contentResolver,
+                android.provider.Settings.Secure.ENABLED_INPUT_METHODS
+            )
+            enabledIMEs?.contains(imeId) == true
+        } catch (e: Exception) {
+            Log.e(TAG, "Error checking if IME is enabled: ${e.message}")
+            false
+        }
+    }
+    
+    private fun isAutomationIMEDefault(): Boolean {
+        return try {
+            val imeId = "$packageName/.AutomationIME"
+            val defaultIME = android.provider.Settings.Secure.getString(
+                contentResolver,
+                android.provider.Settings.Secure.DEFAULT_INPUT_METHOD
+            )
+            defaultIME == imeId
+        } catch (e: Exception) {
+            Log.e(TAG, "Error checking if IME is default: ${e.message}")
+            false
+        }
     }
 
     // ==================== UTILITY FUNCTIONS ====================

@@ -41,7 +41,8 @@ class TapActivity {
                     showTapIndicator(x, y)
 
                     // MyAccessibilityService now handles smart targeting internally
-                    val success = service.performTap(x, y)
+                    // Pass blindTap=true to skip node searching and use pure coordinate-based gesture
+                    val success = service.performTap(x, y, blindTap = true)
                     if (success) {
                         Log.d(TAG, "✅ Tap performed successfully at ($x, $y)")
                     } else {
@@ -144,6 +145,7 @@ class TapActivity {
 
     /**
      * Shows a visual indicator at tap location for testing purposes
+     * Displays a bright red square with border at the exact tap coordinates
      * @param x X coordinate
      * @param y Y coordinate
      */
@@ -155,16 +157,15 @@ class TapActivity {
                 val windowManager = service.getSystemService(android.content.Context.WINDOW_SERVICE) as? WindowManager
                     ?: return@withContext
 
-                // Create bright white dot indicator with border for visibility
-                val indicator = ImageView(service).apply {
-                    setBackgroundColor(0xFFFFFFFF.toInt()) // Bright white
-                    alpha = 0.9f
-                    scaleType = ImageView.ScaleType.CENTER
-                    // Add a black border for better visibility
-                    setPadding(2, 2, 2, 2)
+                // Create a square indicator with bright red border and semi-transparent fill
+                val indicator = View(service).apply {
+                    // Set background to semi-transparent red square with border
+                    setBackgroundResource(android.R.drawable.dialog_frame)
+                    background.setTint(0xFFFF0000.toInt()) // Bright red
+                    alpha = 0.8f
                 }
 
-                val size = 24 // Larger 24dp diameter for better visibility
+                val size = 60 // Large 60dp square for high visibility
                 val params = WindowManager.LayoutParams(
                     size,
                     size,
@@ -175,18 +176,18 @@ class TapActivity {
                     PixelFormat.TRANSLUCENT
                 ).apply {
                     gravity = Gravity.TOP or Gravity.START
+                    // Center the square on the tap coordinates
                     this.x = (x - size / 2).toInt()
                     this.y = (y - size / 2).toInt()
-                    // Add slight elevation for better visibility
-                    dimAmount = 0.0f
                 }
 
                 try {
                     windowManager.addView(indicator, params)
+                    Log.d(TAG, "🎯 Tap indicator shown at ($x, $y)")
 
-                    // Remove after 6 seconds
+                    // Remove after 3 seconds (shorter than before for less clutter)
                     GlobalScope.launch {
-                        delay(6000)
+                        delay(3000)
                         withContext(Dispatchers.Main) {
                             try {
                                 windowManager.removeView(indicator)

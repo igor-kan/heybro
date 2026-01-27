@@ -177,6 +177,12 @@ class AutomationService {
     onAutomationStateChanged?.call(true);
 
     try {
+      // Notify Native Layer (Activity -> IME) that automation started
+      // This switches the keyboard to "Automation Running" mode
+      await _channel.invokeMethod('notifyAutomationState', {'isAutomating': true});
+    } catch (_) {}
+
+    try {
       // 1. Fetch Inventory of Installed Apps
       print('📦 Fetching installed apps inventory...');
       try {
@@ -265,7 +271,22 @@ class AutomationService {
           : LoopResult(isLoop: false);
 
       if (loopResult.isLoop) {
-        print('🔄 LOOP DETECTED: ${loopResult.suggestion}');
+        print('🔄 LOOP DETECTED [${loopResult.loopType}]: ${loopResult.suggestion}');
+        if (loopResult.failedActions != null && loopResult.failedActions!.isNotEmpty) {
+          print('   Failed Actions: ${loopResult.failedActions!.join(' → ')}');
+        }
+        
+        // For severe loops (exact or 3+ semantic matches), consider recovery strategies
+        if (loopResult.loopType == 'exact' || loopResult.loopType == 'stall') {
+          print('⚠️ Severe loop detected - recovery strategies will be suggested to AI');
+          
+          // Activate persistent vision mode if not already active
+          if (!_visionModePersistent) {
+            _visionModePersistent = true;
+            _visionModeReason = 'Loop recovery - accessibility may be unreliable';
+            print('👁️ Activating persistent Vision Mode for loop recovery');
+          }
+        }
       }
 
       // Build AI prompt with visual context and strict validation rules
@@ -615,14 +636,25 @@ bool _isContextIdentical(Map<String, dynamic> prev, Map<String, dynamic> current
 }
 
 String _buildVisionStepPrompt(Map<String, dynamic> context, {LoopResult? loopResult}) {
-  // Build recent history summary
+  // Build detailed history summary from Session
+  String historySummary = "No history yet. Starting fresh.";
   String historyText = '';
-  if (_session != null && _session!.recentActions.isNotEmpty) {
-    historyText = '\nRECENT ACTIONS (Last ${_session!.recentActions.length}):\n';
-    for (int i = 0; i < _session!.recentActions.length; i++) {
-        final step = _session!.recentActions[i];
-        historyText += '${i + 1}. ${step.action} - Result: ${step.result}\n';
-    }
+  
+  if (_session != null) {
+      if (_session!.summary.isNotEmpty) {
+        historySummary = _session!.summary;
+      } else if (_session!.recentActions.isNotEmpty) {
+        historySummary = "Recent actions: " + _session!.recentActions.map((s) => s.action).join(", ");
+      }
+      
+      // Explicit Recent History List (Last 5)
+      if (_session!.recentActions.isNotEmpty) {
+        historyText = '\nRECENT HISTORY (Last ${_session!.recentActions.length}):\n';
+        for (final step in _session!.recentActions) {
+           // Include result to show if previous attempts failed
+           historyText += '• ${step.action} - Result: ${step.result}\n';
+        }
+      }
   }
 
   // Vision Mode Prompt - Streamlined & Visual-First
@@ -633,7 +665,15 @@ Standard accessibility data has FAILED. You must rely on the SCREENSHOT to under
 
 🎯 PRIMARY GOAL: $_currentTask
 Step: $_currentStep
-History: $historyText
+Phase: ${_session?.currentPhase ?? 'executing'}
+
+📜 NARRATIVE HISTORY:
+"$historySummary"
+$historyText
+
+🧠 PREVIOUS PLAN CONTEXT:
+${_session?.nextSteps.isNotEmpty == true ? 'Last Planned Next Steps: "${_session!.nextSteps}"' : '(No previous plan)'}
+
 ${loopResult?.isLoop == true ? '\n⚠️ LOOP WARNING: ${loopResult?.suggestion}\n' : ''}
 
 🖼️ VISUAL INTELLIGENCE
@@ -643,40 +683,67 @@ ${loopResult?.isLoop == true ? '\n⚠️ LOOP WARNING: ${loopResult?.suggestion}
 - Ignore "0 accessibility nodes" warnings - they are expected in this mode.
 
 🧠 REASONING PROTOCOL (Vision First)
-1. **Analyze the Image**: Identify buttons, icons, and text visually.
-2. **Locate Target**: Find the UI element that moves you closer to the PRIMARY GOAL.
-3. **Action**: 
+1. **🕵️ VISUAL VERIFICATION (CRITICAL)**:
+   - READ the "RECENT HISTORY" above.
+   - Did your LAST action successfully change the screen?
+   - **Retry Rule**: You may retry the **same** action ONCE (total 2 attempts) if you think it missed.
+   - **STOP Condition**: If you see you have already tapped the exact same coordinate/element **TWICE consecutively** with no result, **STOP**. Do NOT try a 3rd time.
+   - **Strategy Change**: If 2 attempts failed, you MUST try a different coordinate, scroll, or use a different action.
+
+2. **Analyze the Image**: Identify buttons, icons, and text visually.
+   - Describe the KEY elements you see that are relevant to the goal.
+
+3. **Locate Target**: Find the UI element that moves you closer to the PRIMARY GOAL.
+   - Action: 
    - Use `tap_vision` for buttons/icons. 
-   - Use `perform_grouped_taps` to TYPE on the visual keyboard.
-   - Use `perform_scroll` if the target is off-screen.
+   - TO TYPE TEXT:
+     • **ALWAYS use `robust_text_input`** - This is the ONLY reliable method.
+     • Uses IME service for direct text injection.
+   - **TO CHANGE DATES/NUMBERS (Pickers/Wheels)**:
+     • **DO NOT TAP** the number continuously.
+     • **MUST USE `perform_internal_scroll`** to scroll the wheel up/down.
+   - Use `perform_scroll` if the target is off-screen and also when loop detected.
 
 🚀 AVAILABLE ACTIONS (Vision Mode)
 • tap_vision {"x": 500, "y": 500, "description": "Tap Blue Submit Button"} 
   - PREFERRED for clicking. 
   - x,y must be 0-1000 normalized coordinates.
-• perform_grouped_taps {"taps": [{"x":500,"y":800}, ...]} 
-  - PREFERRED for typing. 
-  - taps must use 0-1000 normalized coordinates.
+• robust_text_input {"text": "hello world"}
+  - **REQUIRED for ALL text input.** Uses IME for direct injection.
+• perform_backspace {}
+  - Delete text using IME backspace.
+
+• perform_internal_scroll {"index": 2, "direction": "down"}
+  - **REQUIRED for Date/Time Pickers, Wheels, and internal lists.**
+  - Scrolls ONLY the specific element. direction="down" usually increments values.
 • perform_swipe / perform_scroll 
   - Use for navigation.
 • perform_home / perform_back
 
-❌ DO NOT use `tap_element_by_text` unless you are 100% sure the system detected it (which is unlikely in Vision Mode).
-❌ DO NOT give up. You have full visual control.
+❌ DO NOT use `tap_element_by_text` unless you are 100% sure the system detected it.
+❌ DO NOT REPEAT the exact same action if you have already failed TWICE in a row.
 
 ✅ RESPONSE FORMAT
+You must return a JSON object with `visual_state`, `next_steps`, and `summary` fields.
+
+Example:
 <thought>
-I see the "Login" button at the bottom (approx x=500, y=1000).
-My goal is to log in.
-I will tap it.
+Step 1: Visual Verification. Last action was "tap login". 
+Current image still shows the Login Screen with valid email.
+Conclusion: The previous tap missed the button or wasn't registered.
+Step 2: Analysis. I see the "Login" button at x=500, y=1000.
+Plan: I will try tapping slightly higher or use a scroll to reset.
 </thought>
 ```json
 {
   "action": "tap_vision",
-  "parameters": {"x": 500, "y": 1000, "description": "Login button"},
-  "description": "Tapping login button visually",
+  "parameters": {"x": 500, "y": 950, "description": "Login button (adjusted)"},
+  "visual_state": "Login screen with username field filled. Keyboard hidden.",
+  "next_steps": "1. Tap login. 2. Verify home screen.",
+  "summary": "Previous tap failed. Retrying login button with adjusted coordinates.",
+  "description": "Tapping login button",
   "is_complete": false,
-  "reasoning": "Visual identification of login button"
+  "reasoning": "Visual identification of login button, adjusted for missed tap"
 }
 ```
 ''';
@@ -702,9 +769,14 @@ String _buildStepPrompt(Map<String, dynamic> context, {LoopResult? loopResult}) 
       : <Map<String, dynamic>>[];
   final hasScreenshot = context['screenshot_available'] == true;
   final ocrText = context['ocr_text'] is String ? (context['ocr_text'] as String) : '';
-  final hasOcr = ocrText.isNotEmpty;
+  final ocrBlocks = context['ocr_blocks'] is List ? List.from(context['ocr_blocks']) : <dynamic>[];
+  final hasOcr = ocrText.isNotEmpty || ocrBlocks.isNotEmpty;
   final visionActive = context['vision_active'] == true || context['vision_fallback_active'] == true;
   final visionRescueMode = context['vision_rescue_mode'] == true;
+  
+  // Get image dimensions for OCR line formatting
+  final ocrImageWidth = (context['ocr_image_width'] as num?)?.toDouble();
+  final ocrImageHeight = (context['ocr_image_height'] as num?)?.toDouble();
   
   // Extract simple hints for form inputs from a11y and OCR
   final inputHints = <String>[];
@@ -746,17 +818,58 @@ String _buildStepPrompt(Map<String, dynamic> context, {LoopResult? loopResult}) 
 ''';
   }
 
+  // Build enhanced loop warning section
+  String loopWarningSection = '';
+  if (loopResult?.isLoop == true) {
+    final failedActionsText = loopResult!.failedActions != null && loopResult.failedActions!.isNotEmpty
+        ? loopResult.failedActions!.join('\n   ')
+        : 'See history above';
+    
+    loopWarningSection = '''\n
+═══════════════════════════════════════════════════════════════
+⛔ CRITICAL: LOOP DETECTED - ${loopResult.loopType?.toUpperCase() ?? 'UNKNOWN'} PATTERN
+═══════════════════════════════════════════════════════════════
+
+🚨 YOU ARE STUCK IN A REPETITIVE LOOP!
+
+Loop Type: ${loopResult.loopType}
+Failed Actions (DO NOT REPEAT):
+   $failedActionsText
+
+${loopResult.suggestion}
+
+🔧 MANDATORY RECOVERY ACTIONS:
+1. **DO NOT** repeat any of the failed actions above
+2. **ANALYZE** why these actions failed (element not responsive, wrong target, etc.)
+3. **TRY ALTERNATIVE**:
+    ${loopResult.loopType == 'semantic' ? '''
+    - Use Vision Mode (tap_vision) with different coordinates
+    - Try scrolling to reveal more options
+    - Look for alternative UI elements that achieve the same goal''' : loopResult.loopType == 'stall' ? '''
+    - Navigate back (perform_back) and try a different path
+    - Return to home screen and restart
+    - Consider if the task is blocked by a system dialog or permission''' : '''
+    - Switch to Vision Mode for visual targeting
+    - Try scrolling to find the correct element
+    - Consider if you need to navigate differently'''}
+
+❌ FORBIDDEN: Repeating the exact same action or tapping the same text/element again
+✅ REQUIRED: Choose a COMPLETELY DIFFERENT approach from the list above
+
+═══════════════════════════════════════════════════════════════
+''';
+  }
+
   // ENHANCED HUMAN-LIKE AUTOMATOR AI AGENT PROMPT - CHAIN OF THOUGHT ENABLED
   String prompt = '''
 🤖 HUMAN-LIKE MOBILE AUTOMATOR AGENT
-You are an intelligent mobile automation agent that mimics human interaction patterns. Your goal is to complete the user's task by navigating the screen, interacting with elements, and managing state effectively.
+You are an intelligent mobile automation agent that mimics human interaction patterns. Your goal is to complete the user's task by navigating the screen, interacting with elements, and managing state effectively.$loopWarningSection
 
 🎯 MISSION BRIEFING
 - Primary Task: $_currentTask
 - Current Phase: ${_session?.currentPhase ?? 'executing'}
 - Recent History: $historyText
 $sessionSummary
-${loopResult?.isLoop == true ? '\n⚠️ LOOP DETECTED: ${loopResult?.suggestion}\n' : ''}
 
 📱 CURRENT SCREEN INTELLIGENCE
 - Interactive Elements: ${screenElements.length} available
@@ -774,8 +887,9 @@ ${_formatAccessibilityTree(accessibilityTree)}
 🚨 SYSTEM NOTIFICATIONS & DIALOGS
 ${systemDialogs.isNotEmpty ? _formatSystemDialogs(systemDialogs) : '[Clean screen - no system interruptions]'}
 
-👁️ VISUAL TEXT RECOGNITION (OCR)
-${hasOcr ? ocrText : '[No readable text detected on screen]'}
+👁️ VISUAL TEXT RECOGNITION (OCR) - INDEXED LINES
+${hasOcr ? _formatOcrTextWithLineNumbers(ocrBlocks, imageWidth: ocrImageWidth, imageHeight: ocrImageHeight) : '[No readable text detected on screen]'}
+💡 TIP: Use [Lx] line numbers with tap_ocr_line to tap specific lines (e.g., tap_ocr_line {"line": 3})
 ${visionActive ? (visionRescueMode ? '\n⚠️ VISION RESCUE MODE ACTIVE: Accessibility tree is empty or broken. Use the visual screenshot to find elements and perform_tap with coordinates.' : '\n👁️ VISION CONTEXT AVAILABLE: You have access to a real-time screenshot. Use it to verify elements or tap using coordinates if accessibility is incomplete.') : ''}
 
 📦 INSTALLED APPS INVENTORY (Launchable)
@@ -805,6 +919,7 @@ ${_installedApps.isEmpty ? '[No apps detected]' : _installedApps.join(', ')}
 
 3. **STRATEGY**:
    - Planning to fill a form? Plan the sequence: Tap Name -> Type Name -> Tap Email -> Type Email.
+   - **DATE/TIME PICKERS**: Do NOT tap the same number repeatedly. Use `perform_internal_scroll` on the wheel/column to change values.
    - Do not rely on "Fresh Eyes". Relate the current screen to your goal and past actions.
 
 ═══════════════════════════════════════════════════════════════
@@ -816,7 +931,8 @@ ${_installedApps.isEmpty ? '[No apps detected]' : _installedApps.join(', ')}
 • tap_element_by_text {"text": "exact_text"} - Tap by visible text
 • tap_element_by_index {"index": number} - Tap by accessibility index (MOST RELIABLE)
 • tap_element_by_bounds {"left":x,"top":y,"right":x2,"bottom":y2} - Tap by coordinates
-• tap_ocr_text {"text": "visible_text"} - Tap OCR-detected text (less accurate)
+• tap_ocr_line {"line": 3} - Tap by OCR line number (BEST for duplicate text)
+• tap_ocr_text {"text": "visible_text", "occurrence": 1} - Tap OCR text (use occurrence for duplicates)
 • tap_ocr_bounds {"left":x,"top":y,"right":x2,"bottom":y2} - Tap OCR bounds
 • perform_tap {"x":x,"y":y} - Direct coordinate tap
 
@@ -835,16 +951,15 @@ ${_installedApps.isEmpty ? '[No apps detected]' : _installedApps.join(', ')}
 • perform_enter
 
 ⌨️ TEXT INPUT:
+• type_text {"text":"your text here"}
+  - Primary text input method. Uses IME for direct injection.
 • advanced_type_text {"text":"content","clearFirst":true,"delayMs":100}
-• type_text {"text":"content"}
-(MANDATORY: You MUST tap/focus the field before typing, unless you just did so in the previous step and confirmed focus).
-
-⌨️ VISION MODE TYPING (When keyboard is visible):
-• perform_grouped_taps {"taps": [{"x":100,"y":200}, {"x":120,"y":200}]}
-  - Use this in VISION MODE when blind typing fails or to type on the virtual keyboard.
-  - Look at the screenshot to find key positions.
-  - Send a list of coordinates to type the whole word/sentence in ONE request.
-  - If keyboard is NOT visible in vision mode, tap the input field first.
+  - Same as type_text with optional parameters.
+• perform_backspace {}
+  - Deletes one character (or use loop for more).
+• perform_internal_scroll {"index": 5, "direction": "up/down/left/right"}
+  - **REQUIRED for pickers (Date/Time), wheels, and inner lists.**
+  - Use instead of tapping for scrollable widgets.
 
 🚀 APP MANAGEMENT:
 • open_app_by_name {"appName": "App Name"}
@@ -878,6 +993,15 @@ RULES:
 - "is_complete": true ONlY when the overarching task is DONE.
 - ONE action per JSON.
 - DO NOT hallucinate elements. If it's not in the lists, scroll or look harder.
+
+## 🎯 Key Patterns
+
+1. **Always start by checking current state** - Look at history and installed apps
+2. **Open the correct app first** - Use `open_app_by_name` based on INSTALLED APPS list
+3. **Follow logical interaction flow** - Tap → Type → Submit
+4. **Use `is_complete: true`** only when the entire task chain is done
+5. **Reference specific indices/elements** from the screen intelligence data
+6. **Chain actions across multiple apps** when needed (Swiggy → Messages)
 ''';
 
     // If we have a stored error from a retry, inject it prominently
@@ -1004,6 +1128,16 @@ Action: $_lastFailedAction
       final parameters = decision['parameters'] as Map<String, dynamic>? ?? {};
       final description = decision['description'] as String?;
       final reasoning = decision['reasoning'] as String?;
+      final summary = decision['summary'] as String?;
+      final visualState = decision['visual_state'] as String?;
+      final nextSteps = decision['next_steps'] as String?;
+
+      // Update narrative summary & thinking state if provided
+      if (_session != null) {
+        if (summary != null) _session!.updateSummary(summary);
+        if (visualState != null) _session!.updateVisualState(visualState);
+        if (nextSteps != null) _session!.updateNextSteps(nextSteps);
+      }
 
       if (!isComplete && action == null) {
         return false;
@@ -1012,6 +1146,25 @@ Action: $_lastFailedAction
       // Validate action sequence to prevent shortcuts
       if (action != null && !_validateActionSequence(action, parameters)) {
         return false;
+      }
+      
+      // STRICT BOUNDARY CHECK: Prevent Agent from Interacting with Itself
+      if (_lastContext != null && _lastContext!['current_app'] is Map) {
+         final currentFnPkg = (_lastContext!['current_app']['packageName'] as String?) ?? '';
+         
+         // Using hardcoded package name of our own app
+         if (currentFnPkg == 'com.vibeagent.dude') {
+             // If we are automating inside "Dude", ONLY allow leaving the app or opening another app
+             if (action != 'perform_home' && action != 'perform_back' && action != 'stopAutomation' && action != 'open_app_by_name') {
+                 print('🚫 BOUNDARY VIOLATION: Agent attempting to interact with own UI ($action). Forcing Home.');
+                 _notifyMessage('⚠️ Safety Boundary: Preventing self-interaction. Returning to Home Screen.');
+                 
+                 // Override action to perform_home
+                 await _executeAction('perform_home', {});
+                 await Future.delayed(const Duration(seconds: 1));
+                 return true;
+             }
+         }
       }
 
       // Send the raw JSON decision to UI instead of descriptive messages
@@ -1253,15 +1406,183 @@ Action: $_lastFailedAction
     return dist <= (maxLength * 0.2).ceil();
   }
 
+  /// Format OCR blocks into indexed lines with position hints for disambiguation
+  /// Returns formatted string with line indices that can be used with tap_ocr_line action
+  String _formatOcrTextWithLineNumbers(List ocrBlocks, {double? imageWidth, double? imageHeight}) {
+    if (ocrBlocks.isEmpty) return '[No OCR text detected]';
+    
+    final lines = <Map<String, dynamic>>[];
+    int lineIndex = 1;
+    
+    // Track text occurrences to mark duplicates
+    final textOccurrences = <String, int>{};
+    
+    // First pass: collect all lines with their info
+    for (final block in ocrBlocks) {
+      if (block is! Map) continue;
+      final blockLines = block['lines'];
+      if (blockLines is! List) continue;
+      
+      for (final line in blockLines) {
+        if (line is! Map) continue;
+        final text = line['text']?.toString().trim() ?? '';
+        if (text.isEmpty) continue;
+        
+        // Get bounds for position calculation
+        final bb = line['boundingBox'];
+        String positionHint = '';
+        if (bb is Map && imageHeight != null && imageHeight > 0) {
+          final centerY = (bb['centerY'] as num?)?.toDouble() ?? 0.0;
+          final centerX = (bb['centerX'] as num?)?.toDouble() ?? 0.0;
+          
+          // Vertical position
+          final vPos = centerY < imageHeight / 3 ? 'top' 
+              : centerY < (imageHeight * 2 / 3) ? 'mid' 
+              : 'bot';
+          
+          // Horizontal position (if imageWidth available)
+          String hPos = '';
+          if (imageWidth != null && imageWidth > 0) {
+            hPos = centerX < imageWidth / 3 ? '-left'
+                : centerX < (imageWidth * 2 / 3) ? '' 
+                : '-right';
+          }
+          
+          positionHint = '($vPos$hPos)';
+        }
+        
+        // Track occurrences for duplicate marking
+        final textLower = text.toLowerCase();
+        textOccurrences[textLower] = (textOccurrences[textLower] ?? 0) + 1;
+        
+        lines.add({
+          'index': lineIndex,
+          'text': text,
+          'positionHint': positionHint,
+          'textLower': textLower,
+          'bounds': bb,
+        });
+        lineIndex++;
+      }
+    }
+    
+    if (lines.isEmpty) return '[No OCR lines detected]';
+    
+    // Second pass: build formatted output with occurrence markers for duplicates
+    final occurrenceCounters = <String, int>{};
+    final buffer = StringBuffer();
+    
+    for (final line in lines) {
+      final text = line['text'] as String;
+      final textLower = line['textLower'] as String;
+      final posHint = line['positionHint'] as String;
+      final idx = line['index'] as int;
+      
+      // Track occurrence number for this text
+      occurrenceCounters[textLower] = (occurrenceCounters[textLower] ?? 0) + 1;
+      final occNum = occurrenceCounters[textLower]!;
+      final totalOcc = textOccurrences[textLower] ?? 1;
+      
+      // Add occurrence marker only if there are duplicates
+      String occMarker = '';
+      if (totalOcc > 1) {
+        occMarker = ' [#$occNum/$totalOcc]';
+      }
+      
+      buffer.writeln('[L$idx] $text $posHint$occMarker');
+    }
+    
+    return buffer.toString().trim();
+  }
+  
+  /// Get a specific OCR line by its index (1-based)
+  /// Returns the line map with boundingBox if found
+  Map<String, dynamic>? _getOcrLineByIndex(List ocrBlocks, int targetIndex) {
+    if (ocrBlocks.isEmpty || targetIndex < 1) return null;
+    
+    int lineIndex = 1;
+    for (final block in ocrBlocks) {
+      if (block is! Map) continue;
+      final blockLines = block['lines'];
+      if (blockLines is! List) continue;
+      
+      for (final line in blockLines) {
+        if (line is! Map) continue;
+        final text = line['text']?.toString().trim() ?? '';
+        if (text.isEmpty) continue;
+        
+        if (lineIndex == targetIndex) {
+          return Map<String, dynamic>.from(line);
+        }
+        lineIndex++;
+      }
+    }
+    return null;
+  }
+
   /// Find best matching OCR result with hierarchical search
-  /// Priority: Element (word) → Line → Block (paragraph)
+  /// NEW Priority: Exact LINE match → Element → Contains match → Fuzzy
+  /// Supports occurrence parameter to select Nth match and position hints
+  /// For duplicate text, use occurrence=2 to get the second instance
   /// Returns a map with 'text', 'boundingBox', and 'level' (element/line/block)
-  Map<String, dynamic>? _findBestOcrMatch(List ocrBlocks, String targetText) {
+  Map<String, dynamic>? _findBestOcrMatch(List ocrBlocks, String targetText, {int? occurrence, String? position}) {
     if (ocrBlocks.isEmpty) return null;
     
     final target = targetText.trim().toLowerCase();
+    final allMatches = <Map<String, dynamic>>[];
     
-    // 1. Search at ELEMENT (word) level - highest precision
+    // Helper to check position filter
+    bool matchesPosition(Map? bounds) {
+      if (position == null || bounds == null) return true;
+      final ctx = _lastContext;
+      final imgHeight = (ctx?['ocr_image_height'] as num?)?.toDouble() ?? 0.0;
+      if (imgHeight == 0) return true;
+      
+      final centerY = (bounds['centerY'] as num?)?.toDouble() ?? 0.0;
+      final posLower = position!.toLowerCase();
+      
+      if (posLower == 'top' && centerY < imgHeight / 3) return true;
+      if (posLower == 'middle' || posLower == 'mid') {
+        if (centerY >= imgHeight / 3 && centerY < imgHeight * 2 / 3) return true;
+      }
+      if (posLower == 'bottom' || posLower == 'bot') {
+        if (centerY >= imgHeight * 2 / 3) return true;
+      }
+      return position == null; // No position filter = match all
+    }
+    
+    // PRIORITY 1: Exact LINE match (full line text equals target)
+    // This prevents matching "Google Pay" when looking for "Pay via GooglePay"
+    for (final block in ocrBlocks) {
+      if (block is! Map) continue;
+      final lines = block['lines'];
+      if (lines is! List) continue;
+      
+      for (final line in lines) {
+        if (line is! Map) continue;
+        final text = line['text']?.toString().trim().toLowerCase() ?? '';
+        
+        if (text == target) {
+          final bounds = line['boundingBox'];
+          if (matchesPosition(bounds)) {
+            allMatches.add({
+              ...Map<String, dynamic>.from(line),
+              'level': 'line',
+              'matchType': 'exact',
+              'priority': 1
+            });
+          }
+        }
+      }
+    }
+    
+    // If we have exact line matches, return the requested occurrence
+    if (allMatches.isNotEmpty) {
+      final idx = (occurrence ?? 1) - 1;
+      return idx < allMatches.length ? allMatches[idx] : allMatches.first;
+    }
+    
+    // PRIORITY 2: Exact ELEMENT (word) match
     for (final block in ocrBlocks) {
       if (block is! Map) continue;
       final lines = block['lines'];
@@ -1276,19 +1597,85 @@ Action: $_lastFailedAction
           if (element is! Map) continue;
           final text = element['text']?.toString().trim().toLowerCase() ?? '';
           
-          // Exact match at word level
           if (text == target) {
-            return {
-              ...Map<String, dynamic>.from(element),
-              'level': 'element',
-              'matchType': 'exact'
-            };
+            final bounds = element['boundingBox'];
+            if (matchesPosition(bounds)) {
+              allMatches.add({
+                ...Map<String, dynamic>.from(element),
+                'level': 'element',
+                'matchType': 'exact',
+                'priority': 2
+              });
+            }
           }
         }
       }
     }
     
-    // 2. Fuzzy search at ELEMENT level
+    if (allMatches.isNotEmpty) {
+      final idx = (occurrence ?? 1) - 1;
+      return idx < allMatches.length ? allMatches[idx] : allMatches.first;
+    }
+    
+    // PRIORITY 3: LINE contains target (partial match)
+    for (final block in ocrBlocks) {
+      if (block is! Map) continue;
+      final lines = block['lines'];
+      if (lines is! List) continue;
+      
+      for (final line in lines) {
+        if (line is! Map) continue;
+        final text = line['text']?.toString().trim().toLowerCase() ?? '';
+        
+        if (text.contains(target)) {
+          final bounds = line['boundingBox'];
+          if (matchesPosition(bounds)) {
+            allMatches.add({
+              ...Map<String, dynamic>.from(line),
+              'level': 'line',
+              'matchType': 'contains',
+              'priority': 3
+            });
+          }
+        }
+      }
+    }
+    
+    if (allMatches.isNotEmpty) {
+      final idx = (occurrence ?? 1) - 1;
+      return idx < allMatches.length ? allMatches[idx] : allMatches.first;
+    }
+    
+    // PRIORITY 4: Fuzzy match at LINE level
+    for (final block in ocrBlocks) {
+      if (block is! Map) continue;
+      final lines = block['lines'];
+      if (lines is! List) continue;
+      
+      for (final line in lines) {
+        if (line is! Map) continue;
+        final text = line['text']?.toString() ?? '';
+        
+        if (_isFuzzyMatch(text, targetText)) {
+          final bounds = line['boundingBox'];
+          if (matchesPosition(bounds)) {
+            allMatches.add({
+              ...Map<String, dynamic>.from(line),
+              'level': 'line',
+              'matchType': 'fuzzy',
+              'priority': 4
+            });
+          }
+        }
+      }
+    }
+    
+    if (allMatches.isNotEmpty) {
+      final idx = (occurrence ?? 1) - 1;
+      return idx < allMatches.length ? allMatches[idx] : allMatches.first;
+    }
+    
+    // PRIORITY 5: Fuzzy at ELEMENT level
     for (final block in ocrBlocks) {
       if (block is! Map) continue;
       final lines = block['lines'];
@@ -1304,82 +1691,43 @@ Action: $_lastFailedAction
           final text = element['text']?.toString() ?? '';
           
           if (_isFuzzyMatch(text, targetText)) {
-            return {
-              ...Map<String, dynamic>.from(element),
-              'level': 'element',
-              'matchType': 'fuzzy'
-            };
+            final bounds = element['boundingBox'];
+            if (matchesPosition(bounds)) {
+              allMatches.add({
+                ...Map<String, dynamic>.from(element),
+                'level': 'element',
+                'matchType': 'fuzzy',
+                'priority': 5
+              });
+            }
           }
         }
       }
     }
     
-    // 3. Search at LINE level
-    for (final block in ocrBlocks) {
-      if (block is! Map) continue;
-      final lines = block['lines'];
-      if (lines is! List) continue;
-      
-      for (final line in lines) {
-        if (line is! Map) continue;
-        final text = line['text']?.toString().trim().toLowerCase() ?? '';
-        
-        if (text == target || text.contains(target)) {
-          return {
-            ...Map<String, dynamic>.from(line),
-            'level': 'line',
-            'matchType': text == target ? 'exact' : 'contains'
-          };
-        }
-      }
+    if (allMatches.isNotEmpty) {
+      final idx = (occurrence ?? 1) - 1;
+      return idx < allMatches.length ? allMatches[idx] : allMatches.first;
     }
     
-    // 4. Fuzzy search at LINE level
-    for (final block in ocrBlocks) {
-      if (block is! Map) continue;
-      final lines = block['lines'];
-      if (lines is! List) continue;
-      
-      for (final line in lines) {
-        if (line is! Map) continue;
-        final text = line['text']?.toString() ?? '';
-        
-        if (_isFuzzyMatch(text, targetText)) {
-          return {
-            ...Map<String, dynamic>.from(line),
-            'level': 'line',
-            'matchType': 'fuzzy'
-          };
-        }
-      }
-    }
-    
-    // 5. Search at BLOCK level (fallback - least precise)
+    // PRIORITY 6: BLOCK level fallback
     for (final block in ocrBlocks) {
       if (block is! Map) continue;
       final text = block['text']?.toString().trim().toLowerCase() ?? '';
       
-      if (text == target || text.contains(target)) {
-        return {
+      if (text == target || text.contains(target) || _isFuzzyMatch(text, targetText)) {
+        allMatches.add({
           ...Map<String, dynamic>.from(block),
           'level': 'block',
-          'matchType': text == target ? 'exact' : 'contains'
-        };
+          'matchType': text == target ? 'exact' : (text.contains(target) ? 'contains' : 'fuzzy'),
+          'priority': 6
+        });
       }
     }
     
-    // 6. Fuzzy at BLOCK level
-    for (final block in ocrBlocks) {
-      if (block is! Map) continue;
-      final text = block['text']?.toString() ?? '';
-      
-      if (_isFuzzyMatch(text, targetText)) {
-        return {
-          ...Map<String, dynamic>.from(block),
-          'level': 'block',
-          'matchType': 'fuzzy'
-        };
-      }
+    if (allMatches.isNotEmpty) {
+      final idx = (occurrence ?? 1) - 1;
+      return idx < allMatches.length ? allMatches[idx] : allMatches.first;
     }
 
     return null;
@@ -1860,12 +2208,62 @@ Action: $_lastFailedAction
       }
 
       // OCR-based actions (use when relying on OCR text/regions)
+      
+      // NEW: Tap by OCR line index - best for duplicate text disambiguation
+      if (action == 'tap_ocr_line') {
+        final lineNum = parameters['line'] as int?;
+        if (lineNum == null || lineNum < 1) {
+          _notifyMessage('❌ Invalid line number for OCR tap. Use line >= 1');
+          return false;
+        }
+
+        // Get OCR blocks from latest context
+        final ctx = _lastContext ?? <String, dynamic>{};
+        List ocrBlocks = (ctx['ocr_blocks'] is List) ? List.from(ctx['ocr_blocks']) : <dynamic>[];
+        
+        // Fetch fresh OCR if needed
+        if (ocrBlocks.isEmpty && ctx['screenshot_available'] == true) {
+          final ss = await ToolsManager.executeTool('take_screenshot', {});
+          if (ss['success'] == true && ss['data'] is String) {
+            final ocrRes = await ToolsManager.executeTool('perform_ocr', { 'screenshot': ss['data'] });
+            if (ocrRes['success'] == true && ocrRes['data'] is Map) {
+              final data = Map<String, dynamic>.from(ocrRes['data']);
+              _lastContext ??= <String, dynamic>{};
+              _lastContext!['ocr_blocks'] = (data['blocks'] is List) ? List.from(data['blocks']) : <dynamic>[];
+              ocrBlocks = List.from(_lastContext!['ocr_blocks'] as List);
+            }
+          }
+        }
+
+        if (ocrBlocks.isEmpty) {
+          _notifyMessage('❌ No OCR blocks available to tap');
+          return false;
+        }
+
+        final line = _getOcrLineByIndex(ocrBlocks, lineNum);
+        if (line == null) {
+          _notifyMessage('❌ OCR line L$lineNum not found');
+          return false;
+        }
+
+        final text = line['text']?.toString() ?? '';
+        final bounds = _getBoundsFromOcrBlock(line);
+        final coords = _getCenterFromBounds(bounds);
+        _notifyMessage('🎯 OCR line tap [L$lineNum] "$text" at (${coords['x']!.round()}, ${coords['y']!.round()})');
+        final result = await ToolsManager.executeTool('perform_tap', { 'x': coords['x'], 'y': coords['y'] });
+        return result['success'] == true;
+      }
+      
       if (action == 'tap_ocr_text') {
         final text = parameters['text'] as String?;
         if (text == null || text.isEmpty) {
           _notifyMessage('❌ No text specified for OCR tap');
           return false;
         }
+        
+        // Extract occurrence and position parameters for disambiguation
+        final occurrence = parameters['occurrence'] as int?;
+        final position = parameters['position'] as String?;
 
         // Prefer OCR from latest context to avoid duplicate runs
         final ctx = _lastContext ?? <String, dynamic>{};
@@ -1894,19 +2292,21 @@ Action: $_lastFailedAction
           return false;
         }
 
-        final block = _findBestOcrBlock(ocrBlocks, text);
+        // Use enhanced matching with occurrence/position support
+        final block = _findBestOcrMatch(ocrBlocks, text, occurrence: occurrence, position: position);
         if (block == null) {
-          _notifyMessage('❌ No matching OCR block for: "$text"');
+          _notifyMessage('❌ No matching OCR block for: "$text"${occurrence != null ? " (occurrence $occurrence)" : ""}');
           return false;
         }
 
         // Log match precision level
         final level = block['level'] ?? 'block';
         final matchType = block['matchType'] ?? 'unknown';
+        final matchedText = block['text']?.toString() ?? text;
         
         final bounds = _getBoundsFromOcrBlock(block);
         final coords = _getCenterFromBounds(bounds);
-        _notifyMessage('🎯 OCR tap [$level/$matchType] on "$text" at (${coords['x']!.round()}, ${coords['y']!.round()})');
+        _notifyMessage('🎯 OCR tap [$level/$matchType] on "$matchedText" at (${coords['x']!.round()}, ${coords['y']!.round()})');
         final result = await ToolsManager.executeTool('perform_tap', { 'x': coords['x'], 'y': coords['y'] });
         return result['success'] == true;
 
@@ -1975,41 +2375,138 @@ Action: $_lastFailedAction
         parameters['duration'] = 300; // Standard swipe duration
       }
 
+      // ===== Perform Backspace =====
+      if (action == 'perform_backspace') {
+         _notifyMessage('⌫ Backspace');
+         // Execute directly via ToolsManager which routes to native IME
+         final result = await ToolsManager.executeTool('perform_backspace', {});
+         return result['success'] == true;
+      }
+
+      // ===== Perform Internal Scroll (Element-centric) =====
+      if (action == 'perform_internal_scroll') {
+         final direction = parameters['direction']?.toString().toLowerCase() ?? 'down';
+         final index = parameters['index'] as int?;
+         final text = parameters['text'] as String?;
+         
+         // Find element target
+         Map<String, dynamic>? targetElement;
+         final elements = _getElementsFromLastContext();
+         
+         if (index != null) {
+            targetElement = _findElementByIndex(elements, index);
+         } else if (text != null) {
+            targetElement = _findElementByText(elements, text);
+         }
+         
+         if (targetElement == null) {
+            _notifyMessage('❌ Internal scroll failed: Target element not found');
+            return false;
+         }
+         
+         final bounds = targetElement['bounds'];
+         if (bounds is! Map) {
+             _notifyMessage('❌ Internal scroll failed: Element has no bounds');
+             return false;
+         }
+         
+         final b = Map<String, dynamic>.from(bounds);
+         final left = (b['left'] as num?)?.toDouble() ?? 0.0;
+         final top = (b['top'] as num?)?.toDouble() ?? 0.0;
+         final right = (b['right'] as num?)?.toDouble() ?? 0.0;
+         final bottom = (b['bottom'] as num?)?.toDouble() ?? 0.0;
+         final w = (b['width'] as num?)?.toDouble() ?? (right - left);
+         final h = (b['height'] as num?)?.toDouble() ?? (bottom - top);
+         
+         final centerX = left + w / 2;
+         final centerY = top + h / 2;
+         
+         // Calculate swipe coordinates WITHIN the element
+         // Use 20% padding to stay safe inside
+         final safeW = w * 0.6;
+         final safeH = h * 0.6;
+         
+         double startX = centerX;
+         double startY = centerY;
+         double endX = centerX;
+         double endY = centerY;
+         
+         // SCROLL SEMANTICS:
+         // "down" -> I want to see content below -> Content moves UP -> Finger moves BOTTOM -> TOP
+         // "up" -> I want to see content above -> Content moves DOWN -> Finger moves TOP -> BOTTOM
+         
+         switch (direction) {
+             case 'down': // Finger moves Up
+                 startY = centerY + (safeH / 2);
+                 endY = centerY - (safeH / 2);
+                 break;
+             case 'up': // Finger moves Down
+                 startY = centerY - (safeH / 2);
+                 endY = centerY + (safeH / 2);
+                 break;
+             case 'right': // I want to see right -> Content moves LEFT -> Finger moves RIGHT -> LEFT
+                 startX = centerX + (safeW / 2);
+                 endX = centerX - (safeW / 2);
+                 break;
+             case 'left': // I want to see left -> Content moves RIGHT -> Finger moves LEFT -> RIGHT
+                 startX = centerX - (safeW / 2);
+                 endX = centerX + (safeW / 2);
+                 break;
+         }
+         
+         _notifyMessage('🔄 Scroll "$direction" inside element [${targetElement['index']}]');
+         _notifyMessage('📍 Swipe: (${startX.round()},${startY.round()}) -> (${endX.round()},${endY.round()})');
+         
+         final result = await ToolsManager.executeTool('perform_swipe', {
+             'startX': startX,
+             'startY': startY,
+             'endX': endX,
+             'endY': endY,
+             'duration': 400 // Slightly slower for precision
+         });
+         
+         return result['success'] == true;
+      }
+
       // Check if action is available
       if (!ToolsManager.isToolAvailable(action)) {
         _notifyMessage('❌ Action not available: $action');
         return false;
       }
 
-      if (action == 'perform_grouped_taps') {
-        final taps = parameters['taps'] as List?;
-        if (taps != null) {
-          // Convert normalized coordinates (0-1000) to device pixels for grouped taps
-          final w = (_lastContext?['ocr_image_width'] as num?)?.toDouble() ?? 0.0;
-          final h = (_lastContext?['ocr_image_height'] as num?)?.toDouble() ?? 0.0;
-          
-          if (w > 0 && h > 0) {
-            _notifyMessage('📏 Normalizing grouped taps to ${w.round()}x${h.round()}');
+      // **Vision Mode Text Input**: Use robust_text_input for reliable, self-healing text input
+      // This replaces the fragile 3-step process (set clipboard → tap → paste) with a comprehensive
+      // solution that validates focus, retries on failure, and uses multiple fallback strategies
+      if ((action == 'type_text' || action == 'advanced_type_text') && _useVision) {
+        try {
+          final textToType = parameters['text']?.toString() ?? '';
+          if (textToType.isNotEmpty) {
+            _notifyMessage('🎯 Vision mode: Using robust text input');
             
-            final scaledTaps = <Map<String, dynamic>>[];
-            for (final tap in taps) {
-              if (tap is Map) {
-                final tx = (tap['x'] as num?)?.toDouble() ?? 0.0;
-                final ty = (tap['y'] as num?)?.toDouble() ?? 0.0;
-                scaledTaps.add({
-                  'x': (tx / 1000.0) * w,
-                  'y': (ty / 1000.0) * h
-                });
-              }
+            // Use the new robust_text_input tool which handles the entire flow:
+            // 1. Sets clipboard
+            // 2. Finds and validates input field focus (with multiple strategies)
+            // 3. Attempts paste with fallback to ACTION_SET_TEXT
+            // 4. Retries up to 3 times with exponential backoff
+            final robustResult = await ToolsManager.executeTool('robust_text_input', {
+              'text': textToType,
+              'maxRetries': 3,
+            });
+            
+            if (robustResult['success'] == true) {
+              _notifyMessage('✅ Robust text input successful');
+              return true;
+            } else {
+              _notifyMessage('⚠️ Robust text input failed, trying fallback...');
+              // Fallback: try normal typing if robust method fails
             }
-            parameters['taps'] = scaledTaps;
           }
-          
-          _notifyMessage('⌨️ executing grouped taps (${taps.length} taps) for vision typing');
+        } catch (e) {
+          _notifyMessage('⚠️ Robust text input error: $e, falling back to normal typing');
         }
       }
 
-      // Execute the tool
+      // Execute the tool (normal mode or fallback)
       var result = await ToolsManager.executeTool(action, parameters);
 
       // If typing failed, try to recover by focusing via OCR and retry once

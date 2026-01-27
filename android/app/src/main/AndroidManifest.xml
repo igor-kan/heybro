@@ -91,6 +91,22 @@
             android:enabled="true"
             android:exported="false" />
 
+        <!-- Automation IME Service for direct text injection -->
+        <service
+            android:name=".AutomationIME"
+            android:permission="android.permission.BIND_INPUT_METHOD"
+            android:exported="true"
+            android:enabled="true">
+
+            <intent-filter>
+                <action android:name="android.view.InputMethod" />
+            </intent-filter>
+
+            <meta-data
+                android:name="android.view.im"
+                android:resource="@xml/ime_service_config" />
+        </service>
+
         <!-- Voice Services -->
         <service
             android:name=".voice.EnhancedWakeWordService"
