@@ -1,0 +1,15 @@
+{
+  "greetings_and_slang": [
+    "Hey bro!", "What's up?", "How's it going?", "Yo!", "Sup?", "G'day mate!", "Ciao!", "Howdy!", "Namaste", "Cheers!", "Bruh", "Fam", "Squad", "No cap", "Bet", "Wagwan"
+  ],
+  "message_templates": [
+    { "type": "Check-in", "content": "Just checking in, hope you're having a great week!" },
+    { "type": "Invitation", "content": "Hey, are you free to grab a coffee or a drink later?" },
+    { "type": "Follow-up", "content": "Great seeing you today! Let's do it again soon." },
+    { "type": "Sharing a Link", "content": "Saw this and thought of you: {link}" },
+    { "type": "Birthday Wish", "content": "Happy Birthday bro! Have a legendary day! 🎂" },
+    { "type": "Hype", "content": "Let's goooo! Massive win on {event}! 🚀" },
+    { "type": "Support", "content": "Keep your head up bro, I'm here if you need to talk." }
+  ],
+  "social_circles": ["Close Friends", "Work Buddies", "Gym Crew", "Family", "Networking"]
+}
