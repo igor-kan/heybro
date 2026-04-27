@@ -120,3 +120,42 @@ Pull requests are welcome\! If you want to make a big change, please open an iss
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 **This is an experimental project. Use responsibly and at your own risk\!**
+
+<!-- REPO_ANALYSIS_OVERVIEW_START -->
+## Repository Analysis Snapshot
+
+Generated: 2026-04-21
+
+- Primary stack: Unknown
+- Key paths: `lib`, `docs`, `README.md`
+- Files scanned (capped): 226
+- Test signal: Test-named files detected
+- CI workflows present: No
+- GitHub slug: igor-kan/heybro
+- GitHub last push: 2026-04-15T04:33:44Z
+
+### Quick Commands
+
+Setup:
+- `Review repository README for setup steps`
+
+Run:
+- `Review repository README for run/start command`
+
+Quality:
+- `Add and run repository-specific tests`
+
+### Companion Docs
+
+- `AGENTS.md`
+- `TASKS.md`
+- `PLANNING.md`
+- `RESEARCH.md`
+- `PROJECT_BRIEF.md`
+
+### Web Research References
+
+- Origin remote: `https://github.com/igor-kan/heybro.git`
+- GitHub homepage: https://youtu.be/b0q0bHPGtck
+- `N/A`
+<!-- REPO_ANALYSIS_OVERVIEW_END -->
